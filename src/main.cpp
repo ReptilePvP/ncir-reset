@@ -2,8 +2,11 @@
 #include <Wire.h>
 #include <math.h>
 #include <float.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
 #include <M5Unified.h>
+#include "secrets.h"
 #include "lv_conf.h"
 #include <lvgl.h>
 #include <Adafruit_MLX90614.h>
@@ -51,6 +54,16 @@ static constexpr uint32_t JOY_NAV_REPEAT_MS = 220;
 static constexpr uint32_t JOY_BUTTON_DEBOUNCE_MS = 220;
 static constexpr uint32_t RESTART_DELAY_MS = 2500;
 
+// WiFi / fan webhook
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+static constexpr uint32_t WIFI_RECONNECT_TIMEOUT_MS = 8000;
+static constexpr uint32_t WIFI_RECONNECT_COOLDOWN_MS = 5000;
+static constexpr uint32_t WIFI_STATUS_UPDATE_MS = 3000;
+static constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
+static constexpr uint32_t FAN_NOTICE_CLEAR_MS = 3000;
+static constexpr int LIVE_SCROLL_STEP_PX = 28;
+static constexpr int LIVE_SCROLL_MAX_PX = 52;
+
 // -----------------------------
 // LVGL globals
 // -----------------------------
@@ -69,6 +82,10 @@ static lv_obj_t* lbl_live_emissivity = nullptr;
 static lv_obj_t* lbl_live_caption = nullptr;
 static lv_obj_t* lbl_live_battery = nullptr;
 static lv_obj_t* bar_live_temp = nullptr;
+static lv_obj_t* lbl_live_fan = nullptr;
+static lv_obj_t* lbl_live_fan_notice = nullptr;
+static lv_obj_t* lbl_live_wifi = nullptr;
+static lv_obj_t* lbl_live_hint = nullptr;
 
 // Stats tab
 static lv_obj_t* lbl_stats_min = nullptr;
@@ -118,6 +135,7 @@ static bool use_fahrenheit = true;
 
 static int current_tab = 0;
 static constexpr int TAB_COUNT = 5;
+static constexpr int LIVE_TAB_INDEX = 0;
 static constexpr int SETTINGS_TAB_INDEX = 2;
 static constexpr int ALERTS_TAB_INDEX = 3;
 static constexpr int CALIBRATION_TAB_INDEX = 4;
@@ -202,6 +220,16 @@ static uint32_t last_temp_update = 0;
 static uint32_t last_lr_nav_ms = 0;
 static uint32_t last_ud_nav_ms = 0;
 static uint32_t last_button_ms = 0;
+
+static bool wifi_connected = false;
+static uint32_t last_wifi_status_ms = 0;
+static uint32_t last_wifi_attempt_ms = 0;
+
+static bool fan_on = false;
+static bool fan_state_known = false;
+static bool fan_request_in_progress = false;
+static char fan_notice_text[48] = "";
+static uint32_t fan_notice_set_ms = 0;
 
 // -----------------------------
 // Helpers
@@ -434,6 +462,120 @@ static void log_debug_setting_change(const char* name, const char* value) {
   Serial.printf("Setting changed: %s=%s\n", name, value);
 }
 
+static void set_fan_notice(const char* msg) {
+  snprintf(fan_notice_text, sizeof(fan_notice_text), "%s", msg);
+  fan_notice_set_ms = millis();
+}
+
+static void update_wifi_status() {
+  wifi_connected = (WiFi.status() == WL_CONNECTED);
+}
+
+static bool connect_wifi(uint32_t timeout_ms) {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeout_ms) {
+    delay(100);
+  }
+
+  wifi_connected = (WiFi.status() == WL_CONNECTED);
+  if (wifi_connected) {
+    Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("WiFi connect failed");
+  }
+  return wifi_connected;
+}
+
+static bool ensure_wifi_connected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    return true;
+  }
+
+  wifi_connected = false;
+  uint32_t now = millis();
+  if (now - last_wifi_attempt_ms < WIFI_RECONNECT_COOLDOWN_MS) {
+    return false;
+  }
+  last_wifi_attempt_ms = now;
+  return connect_wifi(WIFI_RECONNECT_TIMEOUT_MS);
+}
+
+static int32_t live_tab_scroll_max_px() {
+  if (live_tab_page == nullptr) return 0;
+  lv_obj_update_layout(live_tab_page);
+  int32_t max_scroll = lv_obj_get_scroll_top(live_tab_page) + lv_obj_get_scroll_bottom(live_tab_page);
+  if (max_scroll < 0) max_scroll = 0;
+  if (max_scroll > LIVE_SCROLL_MAX_PX) max_scroll = LIVE_SCROLL_MAX_PX;
+  return max_scroll;
+}
+
+static void clamp_live_tab_scroll() {
+  if (live_tab_page == nullptr) return;
+  int32_t max_scroll = live_tab_scroll_max_px();
+  int32_t y = lv_obj_get_scroll_y(live_tab_page);
+  if (y < 0) {
+    lv_obj_scroll_to_y(live_tab_page, 0, LV_ANIM_OFF);
+  } else if (y > max_scroll) {
+    lv_obj_scroll_to_y(live_tab_page, max_scroll, LV_ANIM_OFF);
+  }
+}
+
+static void live_tab_scroll_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_SCROLL) return;
+  clamp_live_tab_scroll();
+}
+
+static void toggle_fan_webhook() {
+  if (fan_request_in_progress) return;
+
+  fan_request_in_progress = true;
+  set_fan_notice("Sending...");
+
+  if (!ensure_wifi_connected()) {
+    set_fan_notice("WiFi unavailable");
+    fan_request_in_progress = false;
+    return;
+  }
+
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(FAN_WEBHOOK_URL)) {
+    set_fan_notice("Bad URL");
+    fan_request_in_progress = false;
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST("{}");
+  http.end();
+
+  if (code >= 200 && code < 300) {
+    fan_on = !fan_on;
+    fan_state_known = true;
+    set_fan_notice(fan_on ? "Fan ON" : "Fan OFF");
+    if (debug_enabled) {
+      Serial.printf("Fan webhook OK (%d), fan_on=%d\n", code, fan_on);
+    }
+  } else {
+    snprintf(fan_notice_text, sizeof(fan_notice_text), "HTTP %d", code);
+    fan_notice_set_ms = millis();
+    if (debug_enabled) {
+      Serial.printf("Fan webhook failed: %d\n", code);
+    }
+  }
+
+  fan_request_in_progress = false;
+}
+
 static bool read_emissivity_value(float& out_value) {
   if (!pahub_select(PAHUB_MLX_CH)) return false;
   delay(1);
@@ -567,8 +709,39 @@ static void build_ui() {
   lbl_live_status = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_status, &::lv_font_montserrat_18, 0);
   lv_obj_set_style_text_color(lbl_live_status, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(lbl_live_status, LV_ALIGN_TOP_LEFT, 8, 164);
+  lv_obj_align(lbl_live_status, LV_ALIGN_TOP_LEFT, 8, 158);
   lv_label_set_text(lbl_live_status, "Zone: --");
+
+  lbl_live_fan = lv_label_create(tab_live);
+  lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(lbl_live_fan, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(lbl_live_fan, LV_ALIGN_TOP_LEFT, 8, 180);
+  lv_label_set_text(lbl_live_fan, "Fan: --");
+
+  lbl_live_wifi = lv_label_create(tab_live);
+  lv_obj_set_style_text_font(lbl_live_wifi, &::lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_live_wifi, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(lbl_live_wifi, LV_ALIGN_TOP_RIGHT, -8, 180);
+  lv_label_set_text(lbl_live_wifi, "WiFi: --");
+
+  lbl_live_fan_notice = lv_label_create(tab_live);
+  lv_obj_set_style_text_font(lbl_live_fan_notice, &::lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_live_fan_notice, lv_color_hex(0xFCD34D), 0);
+  lv_obj_align(lbl_live_fan_notice, LV_ALIGN_TOP_LEFT, 8, 200);
+  lv_label_set_text(lbl_live_fan_notice, "");
+
+  lbl_live_hint = lv_label_create(tab_live);
+  lv_obj_set_style_text_font(lbl_live_hint, &::lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(0x64748B), 0);
+  lv_obj_align(lbl_live_hint, LV_ALIGN_TOP_LEFT, 8, 218);
+  lv_label_set_text(lbl_live_hint, "Up/Down: scroll  Press: toggle fan");
+
+  lv_obj_add_flag(tab_live, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(tab_live, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(tab_live, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_scroll_snap_y(tab_live, LV_SCROLL_SNAP_NONE);
+  lv_obj_remove_flag(tab_live, LV_OBJ_FLAG_SCROLL_ELASTIC);
+  lv_obj_add_event_cb(tab_live, live_tab_scroll_event_cb, LV_EVENT_SCROLL, nullptr);
 
   // Stats
   lbl_stats_min = lv_label_create(tab_stats);
@@ -732,6 +905,32 @@ static void update_ui() {
   snprintf(buf, sizeof(buf), "Zone: %s", zone_text_from_temp_f(object_temp_f));
   lv_label_set_text(lbl_live_status, buf);
   lv_obj_set_style_text_color(lbl_live_status, zone_color_from_temp_f(object_temp_f), 0);
+
+  if (fan_state_known) {
+    snprintf(buf, sizeof(buf), "Fan: %s", fan_on ? "ON" : "OFF");
+  } else {
+    snprintf(buf, sizeof(buf), "Fan: --");
+  }
+  lv_label_set_text(lbl_live_fan, buf);
+  lv_obj_set_style_text_color(
+      lbl_live_fan,
+      fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
+      0);
+
+  snprintf(buf, sizeof(buf), "WiFi: %s", wifi_connected ? "OK" : "--");
+  lv_label_set_text(lbl_live_wifi, buf);
+  lv_obj_set_style_text_color(
+      lbl_live_wifi,
+      wifi_connected ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8),
+      0);
+
+  lv_label_set_text(lbl_live_fan_notice, fan_notice_text);
+  if (fan_notice_text[0] != '\0' && fan_notice_set_ms > 0 &&
+      (millis() - fan_notice_set_ms) > FAN_NOTICE_CLEAR_MS) {
+    fan_notice_text[0] = '\0';
+    fan_notice_set_ms = 0;
+    lv_label_set_text(lbl_live_fan_notice, "");
+  }
 
   // Stats
   if (successful_reads == 0) {
@@ -1070,6 +1269,19 @@ static void handle_joystick_navigation() {
     }
   }
 
+  // Live tab vertical scroll (fan row sits below tab bar)
+  if (current_tab == LIVE_TAB_INDEX && live_tab_page != nullptr && !any_edit_mode_active()) {
+    if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
+      lv_obj_scroll_by_bounded(live_tab_page, 0, -LIVE_SCROLL_STEP_PX, LV_ANIM_OFF);
+      clamp_live_tab_scroll();
+      last_ud_nav_ms = now;
+    } else if (filtered_y < -JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
+      lv_obj_scroll_by_bounded(live_tab_page, 0, LIVE_SCROLL_STEP_PX, LV_ANIM_OFF);
+      clamp_live_tab_scroll();
+      last_ud_nav_ms = now;
+    }
+  }
+
   // Settings adjustments with up/down
   if (current_tab == SETTINGS_TAB_INDEX) {
     if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
@@ -1139,7 +1351,9 @@ static void handle_joystick_navigation() {
 
   // Button
   if (pressed && !last_button_pressed && (now - last_button_ms > JOY_BUTTON_DEBOUNCE_MS)) {
-    if (current_tab == SETTINGS_TAB_INDEX) {
+    if (current_tab == LIVE_TAB_INDEX) {
+      toggle_fan_webhook();
+    } else if (current_tab == SETTINGS_TAB_INDEX) {
       activate_selected_setting();
     } else if (current_tab == ALERTS_TAB_INDEX) {
       activate_selected_alert_setting();
@@ -1170,6 +1384,9 @@ void setup() {
   Wire.begin(PORTA_SDA, PORTA_SCL, I2C_FREQ);
   load_preferences();
   log_debug_settings_summary();
+
+  connect_wifi(WIFI_CONNECT_TIMEOUT_MS);
+  last_wifi_status_ms = millis();
 
   init_lvgl();
   build_ui();
@@ -1218,6 +1435,11 @@ void loop() {
   }
 
   handle_temperature_alert(now);
+
+  if (now - last_wifi_status_ms >= WIFI_STATUS_UPDATE_MS) {
+    update_wifi_status();
+    last_wifi_status_ms = now;
+  }
 
   if (now - last_ui_update >= UI_UPDATE_MS) {
     update_ui();
