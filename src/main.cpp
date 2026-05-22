@@ -61,9 +61,6 @@ static constexpr uint32_t WIFI_RECONNECT_COOLDOWN_MS = 5000;
 static constexpr uint32_t WIFI_STATUS_UPDATE_MS = 3000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
 static constexpr uint32_t FAN_NOTICE_CLEAR_MS = 3000;
-static constexpr int LIVE_SCROLL_STEP_PX = 28;
-static constexpr int LIVE_SCROLL_MAX_PX = 52;
-
 // -----------------------------
 // LVGL globals
 // -----------------------------
@@ -75,17 +72,16 @@ static lv_obj_t* live_tab_page = nullptr;
 static lv_obj_t* tabview = nullptr;
 
 // Live tab
-static lv_obj_t* lbl_live_object = nullptr;
-static lv_obj_t* lbl_live_ambient = nullptr;
-static lv_obj_t* lbl_live_status = nullptr;
-static lv_obj_t* lbl_live_emissivity = nullptr;
-static lv_obj_t* lbl_live_caption = nullptr;
-static lv_obj_t* lbl_live_battery = nullptr;
+static lv_obj_t* live_hero_panel = nullptr;
+static lv_obj_t* lbl_live_temp = nullptr;
 static lv_obj_t* bar_live_temp = nullptr;
+static lv_obj_t* lbl_live_zone = nullptr;
 static lv_obj_t* lbl_live_fan = nullptr;
-static lv_obj_t* lbl_live_fan_notice = nullptr;
 static lv_obj_t* lbl_live_wifi = nullptr;
+static lv_obj_t* lbl_live_emissivity = nullptr;
+static lv_obj_t* lbl_live_fan_notice = nullptr;
 static lv_obj_t* lbl_live_hint = nullptr;
+static lv_obj_t* lbl_battery = nullptr;
 
 // Stats tab
 static lv_obj_t* lbl_stats_min = nullptr;
@@ -328,10 +324,6 @@ static int display_object_temp_whole() {
   return (int)lroundf(use_fahrenheit ? object_temp_f : object_temp_c);
 }
 
-static int display_ambient_temp_whole() {
-  return (int)lroundf(use_fahrenheit ? ambient_temp_f : ambient_temp_c);
-}
-
 static int display_min_temp_whole() {
   float v = use_fahrenheit ? min_temp_f : ((min_temp_f - 32.0f) * (5.0f / 9.0f));
   return (int)lroundf(v);
@@ -509,31 +501,6 @@ static bool ensure_wifi_connected() {
   return connect_wifi(WIFI_RECONNECT_TIMEOUT_MS);
 }
 
-static int32_t live_tab_scroll_max_px() {
-  if (live_tab_page == nullptr) return 0;
-  lv_obj_update_layout(live_tab_page);
-  int32_t max_scroll = lv_obj_get_scroll_top(live_tab_page) + lv_obj_get_scroll_bottom(live_tab_page);
-  if (max_scroll < 0) max_scroll = 0;
-  if (max_scroll > LIVE_SCROLL_MAX_PX) max_scroll = LIVE_SCROLL_MAX_PX;
-  return max_scroll;
-}
-
-static void clamp_live_tab_scroll() {
-  if (live_tab_page == nullptr) return;
-  int32_t max_scroll = live_tab_scroll_max_px();
-  int32_t y = lv_obj_get_scroll_y(live_tab_page);
-  if (y < 0) {
-    lv_obj_scroll_to_y(live_tab_page, 0, LV_ANIM_OFF);
-  } else if (y > max_scroll) {
-    lv_obj_scroll_to_y(live_tab_page, max_scroll, LV_ANIM_OFF);
-  }
-}
-
-static void live_tab_scroll_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_SCROLL) return;
-  clamp_live_tab_scroll();
-}
-
 static void toggle_fan_webhook() {
   if (fan_request_in_progress) return;
 
@@ -663,85 +630,75 @@ static void build_ui() {
 
   lv_obj_set_style_bg_color(tab_live, lv_color_hex(0x0F172A), 0);
   lv_obj_set_style_bg_opa(tab_live, LV_OPA_COVER, 0);
+  lv_obj_remove_flag(tab_live, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Live
-  lbl_live_caption = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_caption, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_caption, lv_color_hex(0x38BDF8), 0);
-  lv_obj_align(lbl_live_caption, LV_ALIGN_TOP_LEFT, 8, 8);
-  lv_label_set_text(lbl_live_caption, "Live Temperature");
+  // Live tab — fixed positions only (no flex / content-sized panels)
+  live_hero_panel = lv_obj_create(tab_live);
+  lv_obj_set_size(live_hero_panel, 288, 108);
+  lv_obj_align(live_hero_panel, LV_ALIGN_TOP_MID, 0, 6);
+  lv_obj_set_style_bg_color(live_hero_panel, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_opa(live_hero_panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(live_hero_panel, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_border_width(live_hero_panel, 1, 0);
+  lv_obj_set_style_radius(live_hero_panel, 12, 0);
+  lv_obj_set_style_pad_all(live_hero_panel, 0, 0);
+  lv_obj_remove_flag(live_hero_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-  lbl_live_battery = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_battery, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_battery, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_battery, LV_ALIGN_TOP_RIGHT, -8, 8);
-  lv_label_set_text(lbl_live_battery, "Battery: --");
+  lbl_live_temp = lv_label_create(live_hero_panel);
+  lv_obj_set_style_text_font(lbl_live_temp, &::lv_font_montserrat_32, 0);
+  lv_obj_set_style_text_color(lbl_live_temp, lv_color_hex(0xE2E8F0), 0);
+  lv_obj_align(lbl_live_temp, LV_ALIGN_TOP_MID, 0, 10);
+  lv_label_set_text(lbl_live_temp, "-- F");
 
-  lbl_live_object = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_object, &::lv_font_montserrat_32, 0);
-  lv_obj_set_style_text_color(lbl_live_object, lv_color_hex(0x22D3EE), 0);
-  lv_obj_set_style_text_opa(lbl_live_object, LV_OPA_COVER, 0);
-  lv_obj_align(lbl_live_object, LV_ALIGN_TOP_LEFT, 8, 28);
-  lv_label_set_text(lbl_live_object, "Object: -- F");
-
-  lbl_live_ambient = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_ambient, &::lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(lbl_live_ambient, lv_color_hex(0xCBD5E1), 0);
-  lv_obj_align(lbl_live_ambient, LV_ALIGN_TOP_LEFT, 8, 74);
-  lv_label_set_text(lbl_live_ambient, "Ambient: -- F");
-
-  lbl_live_emissivity = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_emissivity, &::lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(lbl_live_emissivity, lv_color_hex(0xFCD34D), 0);
-  lv_obj_align(lbl_live_emissivity, LV_ALIGN_TOP_LEFT, 8, 102);
-  lv_label_set_text(lbl_live_emissivity, "Emissivity: 0.95");
-
-  bar_live_temp = lv_bar_create(tab_live);
-  lv_obj_set_size(bar_live_temp, 280, 18);
-  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_LEFT, 8, 132);
+  bar_live_temp = lv_bar_create(live_hero_panel);
+  lv_obj_set_size(bar_live_temp, 256, 10);
+  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_MID, 0, 52);
   lv_bar_set_range(bar_live_temp, 0, 800);
   lv_bar_set_value(bar_live_temp, 0, LV_ANIM_OFF);
-  lv_obj_set_style_radius(bar_live_temp, 8, 0);
-  lv_obj_set_style_bg_color(bar_live_temp, lv_color_hex(0x1E293B), LV_PART_MAIN);
+  lv_obj_set_style_radius(bar_live_temp, 5, 0);
+  lv_obj_set_style_radius(bar_live_temp, 5, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(bar_live_temp, lv_color_hex(0x0F172A), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(bar_live_temp, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_pad_all(bar_live_temp, 2, 0);
+  lv_obj_set_style_pad_all(bar_live_temp, 0, 0);
 
-  lbl_live_status = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_status, &::lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(lbl_live_status, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(lbl_live_status, LV_ALIGN_TOP_LEFT, 8, 158);
-  lv_label_set_text(lbl_live_status, "Zone: --");
+  lbl_live_zone = lv_label_create(live_hero_panel);
+  lv_obj_set_style_text_font(lbl_live_zone, &::lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_live_zone, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(lbl_live_zone, LV_ALIGN_TOP_MID, 0, 78);
+  lv_label_set_text(lbl_live_zone, "--");
 
   lbl_live_fan = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_fan, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_fan, LV_ALIGN_TOP_LEFT, 8, 180);
-  lv_label_set_text(lbl_live_fan, "Fan: --");
+  lv_obj_align(lbl_live_fan, LV_ALIGN_BOTTOM_LEFT, 10, -34);
+  lv_label_set_text(lbl_live_fan, "Fan --");
 
   lbl_live_wifi = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_wifi, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_wifi, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_wifi, LV_ALIGN_TOP_RIGHT, -8, 180);
-  lv_label_set_text(lbl_live_wifi, "WiFi: --");
+  lv_obj_align(lbl_live_wifi, LV_ALIGN_BOTTOM_RIGHT, -10, -34);
+  lv_label_set_text(lbl_live_wifi, "WiFi --");
+
+  lbl_live_emissivity = lv_label_create(tab_live);
+  lv_obj_set_style_text_font(lbl_live_emissivity, &::lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_live_emissivity, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(lbl_live_emissivity, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_label_set_text(lbl_live_emissivity, "e 0.95");
 
   lbl_live_fan_notice = lv_label_create(tab_live);
+  lv_obj_set_width(lbl_live_fan_notice, 280);
   lv_obj_set_style_text_font(lbl_live_fan_notice, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_fan_notice, lv_color_hex(0xFCD34D), 0);
-  lv_obj_align(lbl_live_fan_notice, LV_ALIGN_TOP_LEFT, 8, 200);
+  lv_obj_set_style_text_align(lbl_live_fan_notice, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(lbl_live_fan_notice, LV_ALIGN_BOTTOM_MID, 0, -50);
+  lv_label_set_long_mode(lbl_live_fan_notice, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_live_fan_notice, "");
 
   lbl_live_hint = lv_label_create(tab_live);
-  lv_obj_set_style_text_font(lbl_live_hint, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(0x64748B), 0);
-  lv_obj_align(lbl_live_hint, LV_ALIGN_TOP_LEFT, 8, 218);
-  lv_label_set_text(lbl_live_hint, "Up/Down: scroll  Press: toggle fan");
-
-  lv_obj_add_flag(tab_live, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scroll_dir(tab_live, LV_DIR_VER);
-  lv_obj_set_scrollbar_mode(tab_live, LV_SCROLLBAR_MODE_AUTO);
-  lv_obj_set_scroll_snap_y(tab_live, LV_SCROLL_SNAP_NONE);
-  lv_obj_remove_flag(tab_live, LV_OBJ_FLAG_SCROLL_ELASTIC);
-  lv_obj_add_event_cb(tab_live, live_tab_scroll_event_cb, LV_EVENT_SCROLL, nullptr);
+  lv_obj_set_style_text_font(lbl_live_hint, &::lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(0x475569), 0);
+  lv_obj_align(lbl_live_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+  lv_label_set_text(lbl_live_hint, "Press: toggle fan");
 
   // Stats
   lbl_stats_min = lv_label_create(tab_stats);
@@ -861,32 +818,34 @@ static void build_ui() {
   lv_obj_set_style_text_color(lbl_calibration_hint, lv_color_hex(0x94A3B8), 0);
   lv_obj_align(lbl_calibration_hint, LV_ALIGN_TOP_LEFT, 8, 126);
   lv_label_set_text(lbl_calibration_hint, "Up/Down: adjust offset\nPress: save offset");
+
+  // Battery overlay — visible on every tab
+  lbl_battery = lv_label_create(scr);
+  lv_obj_set_style_text_font(lbl_battery, &::lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x64748B), 0);
+  lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -6, 6);
+  lv_label_set_text(lbl_battery, "--%");
+  lv_obj_move_foreground(lbl_battery);
 }
 
 static void update_ui() {
   char buf[96];
 
-  // Live tab
-  snprintf(buf, sizeof(buf), "Object: %d %s", display_object_temp_whole(), current_units_text());
-  lv_label_set_text(lbl_live_object, buf);
-
-  snprintf(buf, sizeof(buf), "Ambient: %d %s", display_ambient_temp_whole(), current_units_text());
-  lv_label_set_text(lbl_live_ambient, buf);
-
-  snprintf(buf, sizeof(buf), "Emissivity: %.2f", current_emissivity);
-  lv_label_set_text(lbl_live_emissivity, buf);
-
+  // Battery (all tabs)
   if (battery_level_pct >= 0) {
-    snprintf(
-        buf,
-        sizeof(buf),
-        "Battery: %d%%%s",
-        battery_level_pct,
-        battery_charging ? " +" : "");
+    snprintf(buf, sizeof(buf), "%d%%%s", battery_level_pct, battery_charging ? "+" : "");
   } else {
-    snprintf(buf, sizeof(buf), "Battery: --");
+    snprintf(buf, sizeof(buf), "--%%");
   }
-  lv_label_set_text(lbl_live_battery, buf);
+  lv_label_set_text(lbl_battery, buf);
+
+  // Live tab
+  snprintf(buf, sizeof(buf), "%d %s", display_object_temp_whole(), current_units_text());
+  lv_label_set_text(lbl_live_temp, buf);
+  lv_obj_set_style_text_color(lbl_live_temp, zone_color_from_temp_f(object_temp_f), 0);
+
+  snprintf(buf, sizeof(buf), "e %.2f", current_emissivity);
+  lv_label_set_text(lbl_live_emissivity, buf);
 
   if (use_fahrenheit) {
     lv_bar_set_range(bar_live_temp, 0, 800);
@@ -901,15 +860,19 @@ static void update_ui() {
     lv_obj_set_style_bg_color(live_tab_page, live_bg, 0);
     lv_obj_set_style_bg_opa(live_tab_page, LV_OPA_COVER, 0);
   }
+  if (live_hero_panel != nullptr) {
+    lv_color_t border = alert_visual_active ? lv_color_hex(0x4ADE80) : zone_color_from_temp_f(object_temp_f);
+    lv_obj_set_style_border_color(live_hero_panel, border, 0);
+    lv_obj_set_style_border_width(live_hero_panel, alert_visual_active ? 2 : 1, 0);
+  }
 
-  snprintf(buf, sizeof(buf), "Zone: %s", zone_text_from_temp_f(object_temp_f));
-  lv_label_set_text(lbl_live_status, buf);
-  lv_obj_set_style_text_color(lbl_live_status, zone_color_from_temp_f(object_temp_f), 0);
+  lv_label_set_text(lbl_live_zone, zone_text_from_temp_f(object_temp_f));
+  lv_obj_set_style_text_color(lbl_live_zone, zone_color_from_temp_f(object_temp_f), 0);
 
   if (fan_state_known) {
-    snprintf(buf, sizeof(buf), "Fan: %s", fan_on ? "ON" : "OFF");
+    snprintf(buf, sizeof(buf), "Fan %s", fan_on ? "ON" : "off");
   } else {
-    snprintf(buf, sizeof(buf), "Fan: --");
+    snprintf(buf, sizeof(buf), "Fan --");
   }
   lv_label_set_text(lbl_live_fan, buf);
   lv_obj_set_style_text_color(
@@ -917,7 +880,7 @@ static void update_ui() {
       fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
       0);
 
-  snprintf(buf, sizeof(buf), "WiFi: %s", wifi_connected ? "OK" : "--");
+  snprintf(buf, sizeof(buf), "WiFi %s", wifi_connected ? "OK" : "--");
   lv_label_set_text(lbl_live_wifi, buf);
   lv_obj_set_style_text_color(
       lbl_live_wifi,
@@ -1266,19 +1229,6 @@ static void handle_joystick_navigation() {
     } else if (filtered_x < -JOY_NAV_H_THRESH && (now - last_lr_nav_ms > JOY_NAV_REPEAT_MS)) {
       goto_tab(current_tab - 1);
       last_lr_nav_ms = now;
-    }
-  }
-
-  // Live tab vertical scroll (fan row sits below tab bar)
-  if (current_tab == LIVE_TAB_INDEX && live_tab_page != nullptr && !any_edit_mode_active()) {
-    if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
-      lv_obj_scroll_by_bounded(live_tab_page, 0, -LIVE_SCROLL_STEP_PX, LV_ANIM_OFF);
-      clamp_live_tab_scroll();
-      last_ud_nav_ms = now;
-    } else if (filtered_y < -JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
-      lv_obj_scroll_by_bounded(live_tab_page, 0, LIVE_SCROLL_STEP_PX, LV_ANIM_OFF);
-      clamp_live_tab_scroll();
-      last_ud_nav_ms = now;
     }
   }
 
