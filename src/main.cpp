@@ -61,6 +61,10 @@ static constexpr uint32_t WIFI_RECONNECT_COOLDOWN_MS = 5000;
 static constexpr uint32_t WIFI_STATUS_UPDATE_MS = 3000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
 static constexpr uint32_t FAN_NOTICE_CLEAR_MS = 3000;
+static constexpr uint32_t IDLE_SLEEP_TIMEOUT_MS = 120000;
+static constexpr int IDLE_JOY_ACTIVITY_THRESH = 20;
+static constexpr uint64_t SLEEP_POLL_US = 200000;
+
 // -----------------------------
 // LVGL globals
 // -----------------------------
@@ -94,6 +98,7 @@ static lv_obj_t* lbl_settings_units = nullptr;
 static lv_obj_t* lbl_settings_refresh = nullptr;
 static lv_obj_t* lbl_settings_emissivity = nullptr;
 static lv_obj_t* lbl_settings_debug = nullptr;
+static lv_obj_t* lbl_settings_power_off = nullptr;
 static lv_obj_t* slider_settings_emissivity = nullptr;
 static lv_obj_t* lbl_settings_notice = nullptr;
 static lv_obj_t* lbl_settings_hint = nullptr;
@@ -155,7 +160,8 @@ enum SettingsRow {
   SETTINGS_ROW_REFRESH = 1,
   SETTINGS_ROW_EMISSIVITY = 2,
   SETTINGS_ROW_DEBUG = 3,
-  SETTINGS_ROW_COUNT = 4
+  SETTINGS_ROW_POWER_OFF = 4,
+  SETTINGS_ROW_COUNT = 5
 };
 
 enum AlertsRow {
@@ -226,6 +232,12 @@ static bool fan_state_known = false;
 static bool fan_request_in_progress = false;
 static char fan_notice_text[48] = "";
 static uint32_t fan_notice_set_ms = 0;
+
+static bool device_sleeping = false;
+static uint32_t last_activity_ms = 0;
+static uint32_t wake_cooldown_until_ms = 0;
+
+static void update_ui();
 
 // -----------------------------
 // Helpers
@@ -501,6 +513,93 @@ static bool ensure_wifi_connected() {
   return connect_wifi(WIFI_RECONNECT_TIMEOUT_MS);
 }
 
+static void note_user_activity() {
+  last_activity_ms = millis();
+}
+
+static uint32_t ms_since_last_activity() {
+  uint32_t now = millis();
+  if (now >= last_activity_ms) return now - last_activity_ms;
+  return 0;
+}
+
+static bool idle_sleep_timeout_elapsed() {
+  if (millis() < wake_cooldown_until_ms) return false;
+  return ms_since_last_activity() >= IDLE_SLEEP_TIMEOUT_MS;
+}
+
+static bool joystick_has_activity(int x, int y, bool pressed) {
+  if (pressed) return true;
+  if (abs(x) > IDLE_JOY_ACTIVITY_THRESH) return true;
+  if (abs(y) > IDLE_JOY_ACTIVITY_THRESH) return true;
+  return false;
+}
+
+static bool touch_has_activity() {
+  if (M5.Touch.getCount() == 0) return false;
+  auto detail = M5.Touch.getDetail(0);
+  return detail.isPressed() || detail.wasClicked() || detail.wasReleased();
+}
+
+static void wake_from_sleep() {
+  if (!device_sleeping) return;
+
+  device_sleeping = false;
+  note_user_activity();
+  wake_cooldown_until_ms = millis() + 3000;
+  M5.Display.wakeup();
+  connect_wifi(WIFI_RECONNECT_TIMEOUT_MS);
+  last_wifi_status_ms = millis();
+  update_ui();
+  Serial.println("Wake from sleep");
+}
+
+static void enter_sleep_mode() {
+  if (device_sleeping || restart_pending || any_edit_mode_active()) return;
+
+  device_sleeping = true;
+  alert_visual_active = false;
+  WiFi.disconnect(true);
+  wifi_connected = false;
+  M5.Display.sleep();
+  Serial.println("Entering sleep (idle 2 min)");
+}
+
+static void handle_sleep_mode() {
+  while (device_sleeping) {
+    M5.update();
+
+    uint8_t raw_x = JOY_CENTER;
+    uint8_t raw_y = JOY_CENTER;
+    bool pressed = false;
+    if (read_joystick2_raw(raw_x, raw_y, pressed)) {
+      int x = (int)raw_x - JOY_CENTER;
+      int y = JOY_CENTER - (int)raw_y;
+      if (joystick_has_activity(x, y, pressed)) {
+        wake_from_sleep();
+        return;
+      }
+    }
+
+    if (touch_has_activity()) {
+      wake_from_sleep();
+      return;
+    }
+
+    M5.Power.lightSleep(SLEEP_POLL_US, false);
+  }
+}
+
+static void power_off_device() {
+  save_preferences();
+  snprintf(settings_notice_text, sizeof(settings_notice_text), "Powering off...");
+  update_ui();
+  lv_timer_handler();
+  delay(150);
+  Serial.println("Power off requested");
+  M5.Power.powerOff();
+}
+
 static void toggle_fan_webhook() {
   if (fan_request_in_progress) return;
 
@@ -739,12 +838,18 @@ static void build_ui() {
 
   lbl_settings_debug = lv_label_create(tab_settings);
   lv_obj_set_style_text_font(lbl_settings_debug, &::lv_font_montserrat_18, 0);
-  lv_obj_align(lbl_settings_debug, LV_ALIGN_TOP_LEFT, 8, 98);
+  lv_obj_align(lbl_settings_debug, LV_ALIGN_TOP_LEFT, 8, 86);
   lv_label_set_text(lbl_settings_debug, "Debug: OFF");
+
+  lbl_settings_power_off = lv_label_create(tab_settings);
+  lv_obj_set_style_text_font(lbl_settings_power_off, &::lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(lbl_settings_power_off, lv_color_hex(0xF87171), 0);
+  lv_obj_align(lbl_settings_power_off, LV_ALIGN_TOP_LEFT, 8, 112);
+  lv_label_set_text(lbl_settings_power_off, "Power off");
 
   slider_settings_emissivity = lv_slider_create(tab_settings);
   lv_obj_set_size(slider_settings_emissivity, 220, 12);
-  lv_obj_align(slider_settings_emissivity, LV_ALIGN_TOP_LEFT, 8, 128);
+  lv_obj_align(slider_settings_emissivity, LV_ALIGN_TOP_LEFT, 8, 132);
   lv_slider_set_range(slider_settings_emissivity, EMISSIVITY_SLIDER_MIN, EMISSIVITY_SLIDER_MAX);
   lv_slider_set_value(slider_settings_emissivity, emissivity_to_slider_value(pending_emissivity), LV_ANIM_OFF);
 
@@ -752,15 +857,15 @@ static void build_ui() {
   lv_obj_set_width(lbl_settings_notice, 300);
   lv_obj_set_style_text_font(lbl_settings_notice, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_settings_notice, lv_color_hex(0xFCD34D), 0);
-  lv_obj_align(lbl_settings_notice, LV_ALIGN_TOP_LEFT, 8, 150);
+  lv_obj_align(lbl_settings_notice, LV_ALIGN_TOP_LEFT, 8, 154);
   lv_label_set_long_mode(lbl_settings_notice, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_settings_notice, "");
 
   lbl_settings_hint = lv_label_create(tab_settings);
   lv_obj_set_style_text_font(lbl_settings_hint, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_settings_hint, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_settings_hint, LV_ALIGN_TOP_LEFT, 8, 198);
-  lv_label_set_text(lbl_settings_hint, "Left/Right: tabs\nUp/Down: select setting\nPress: change/apply");
+  lv_obj_align(lbl_settings_hint, LV_ALIGN_TOP_LEFT, 8, 178);
+  lv_label_set_text(lbl_settings_hint, "Idle 2 min: sleep\nLeft/Right: tabs  Up/Down: select\nPress: change / power off");
 
   // Alerts
   lbl_alerts_enabled = lv_label_create(tab_alerts);
@@ -953,6 +1058,10 @@ static void update_ui() {
       lbl_settings_debug,
       selected_settings_row == SETTINGS_ROW_DEBUG ? selected_color : normal_color,
       0);
+  lv_obj_set_style_text_color(
+      lbl_settings_power_off,
+      selected_settings_row == SETTINGS_ROW_POWER_OFF ? lv_color_hex(0xF87171) : lv_color_hex(0x94A3B8),
+      0);
   lv_obj_set_style_bg_color(
       slider_settings_emissivity,
       selected_settings_row == SETTINGS_ROW_EMISSIVITY ? accent_color : normal_color,
@@ -965,7 +1074,7 @@ static void update_ui() {
       lbl_settings_hint,
       emissivity_edit_mode
           ? "Up/Down: adjust emissivity\nPress: save + restart"
-          : "Left/Right: tabs\nUp/Down: select setting\nPress: change/apply");
+          : "Idle 2 min: sleep\nLeft/Right: tabs  Up/Down: select\nPress: change / power off");
 
   // Alerts
   snprintf(buf, sizeof(buf), "Alerts: %s", alerts_enabled ? "ON" : "OFF");
@@ -1040,6 +1149,7 @@ static void update_ui() {
 static void goto_tab(int idx) {
   current_tab = clamp_value(idx, 0, TAB_COUNT - 1);
   lv_tabview_set_active(tabview, current_tab, LV_ANIM_OFF);
+  note_user_activity();
 }
 
 static void schedule_restart_notice(const char* text) {
@@ -1110,6 +1220,11 @@ static void activate_selected_setting() {
       Serial.println("Debug mode disabled");
     }
     snprintf(settings_notice_text, sizeof(settings_notice_text), "Debug mode updated.");
+    return;
+  }
+
+  if (selected_settings_row == SETTINGS_ROW_POWER_OFF) {
+    power_off_device();
   }
 }
 
@@ -1205,13 +1320,14 @@ static void activate_selected_calibration_setting() {
 }
 
 static void handle_joystick_navigation() {
-  if (restart_pending) return;
+  if (restart_pending || device_sleeping) return;
 
   uint8_t rawX = JOY_CENTER;
   uint8_t rawY = JOY_CENTER;
   bool pressed = false;
 
   if (!read_joystick2_raw(rawX, rawY, pressed)) return;
+  note_user_activity();
 
   int x = (int)rawX - JOY_CENTER;
   int y = JOY_CENTER - (int)rawY;  // invert so up is positive-ish
@@ -1360,12 +1476,19 @@ void setup() {
   }
 
   update_ui();
+  note_user_activity();
 }
 
 void loop() {
   M5.update();
 
   uint32_t now = millis();
+
+  if (device_sleeping) {
+    handle_sleep_mode();
+    return;
+  }
+
   battery_level_pct = M5.Power.getBatteryLevel();
   battery_charging = M5.Power.isCharging();
 
@@ -1377,6 +1500,14 @@ void loop() {
   if (now - last_joy_update >= JOY_UPDATE_MS) {
     handle_joystick_navigation();
     last_joy_update = now;
+  }
+
+  if (!restart_pending && !any_edit_mode_active() && idle_sleep_timeout_elapsed()) {
+    enter_sleep_mode();
+    if (device_sleeping) {
+      handle_sleep_mode();
+      return;
+    }
   }
 
   if (sensor_ok && (now - last_temp_update >= (uint32_t)refresh_options_ms[refresh_index])) {
