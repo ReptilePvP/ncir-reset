@@ -23,6 +23,8 @@ Built with **PlatformIO**, **Arduino**, **M5Unified**, and **LVGL 9**.
 13. [Serial debug](#serial-debug)
 14. [Libraries](#libraries)
 15. [Troubleshooting](#troubleshooting)
+16. [Release status](#release-status)
+17. [Performance and roadmap](#performance-and-roadmap)
 
 ---
 
@@ -37,8 +39,8 @@ The device continuously measures **object temperature** (what the MLX90614 is po
 | Settings | Units, refresh rate, emissivity, debug, power off |
 | Alerts | Enable/disable and threshold with sound + green screen highlight |
 | Calibration | Offset applied to object and ambient readings (stored in °F internally) |
-| Fan control | HTTP POST to a webhook (e.g. Home Assistant) from the Live tab |
-| Idle sleep | Display off after 2 minutes with no input; wake on joystick or touch |
+| Fan control | Non-blocking HTTP POST to a webhook (e.g. Home Assistant) from the Live tab |
+| Idle sleep | Battery-only display sleep after 2 minutes without activity; USB power keeps it awake |
 | Power off | Full shutdown via PMIC (`M5.Power.powerOff()`); wake with hardware power button |
 
 Ambient temperature is still read for the sensor but is **not** shown on the Live tab.
@@ -57,6 +59,8 @@ Ambient temperature is still read for the sensor but is **not** shown on the Liv
 **Port A I2C:** SDA = GPIO **2**, SCL = GPIO **1**, 100 kHz.
 
 External **5V bus power** for Port A is enabled at boot (`M5.Power.setExtOutput(true)`).
+
+Battery charging is explicitly enabled at **4.20 V / 500 mA**. The UI appends `+` to the battery percentage only while M5Unified reports an active charging state.
 
 ```
 CoreS3 (Port A)
@@ -110,7 +114,7 @@ Edit `include/secrets.h`:
 
 ```bash
 pio run -e m5stack-cores3
-pio run -e m5stack-cores3 -t upload
+pio run -e m5stack-cores3 -t upload --upload-port COM3
 ```
 
 Serial monitor (115200 baud):
@@ -144,10 +148,12 @@ Five tabs at the top of the screen. **Battery** (`92%+`) is shown in the top-rig
 | **Fan** | Last known fan state after webhook (`ON` / `off` / `--`) |
 | **WiFi** | `OK` or `--` |
 | **e 0.95** | Current emissivity |
-| Yellow notice | Fan webhook status (clears after 3 s) |
+| Yellow notice | Fan webhook status; `Sending...` remains visible until the request finishes |
 | Hint | `Press: toggle fan` |
 
 Card border turns **green** when an alert is active.
+
+The webhook runs in a FreeRTOS worker task so WiFi reconnect and HTTP timeouts do not freeze the LVGL loop. A second press is ignored while a request is active. An HTTP **2xx** response toggles the locally remembered fan state; this is not a query of the fan's physical state.
 
 ### Stats
 
@@ -224,12 +230,13 @@ Zones use **object temperature in °F** internally (even when displaying °C).
 
 ### Idle sleep (2 minutes)
 
-- Timer resets on: successful joystick read, tab change, or touch.
-- After **120 s** idle (and not in an edit mode): display sleep, WiFi disconnect.
-- Wake: joystick movement/button or screen touch → display on, WiFi reconnect.
+- Timer resets on: meaningful joystick movement/button input, tab changes, touch, or a **1 °F** object-temperature change from the activity baseline.
+- While USB VBUS is at least **4.0 V**, idle sleep is disabled.
+- After **120 s** idle on battery (and not in an edit mode): display sleep, WiFi disconnect.
+- Wake: joystick movement/button, screen touch, or connecting USB power → display on, WiFi reconnect.
 - **3 s** cooldown after wake before sleep can trigger again.
 
-Constants: `IDLE_SLEEP_TIMEOUT_MS`, `SLEEP_POLL_US` in `main.cpp`.
+Constants: `IDLE_SLEEP_TIMEOUT_MS`, `TEMP_ACTIVITY_DELTA_F`, `USB_POWER_PRESENT_MV`, and `SLEEP_POLL_US` in `main.cpp`.
 
 ### Power off
 
@@ -269,6 +276,8 @@ Stored in ESP32 **Preferences** namespace `uiflow`:
 | `IDLE_SLEEP_TIMEOUT_MS` | 120000 | Idle before sleep |
 | `WIFI_CONNECT_TIMEOUT_MS` | 10000 | Initial WiFi connect |
 | `HTTP_TIMEOUT_MS` | 5000 | Fan webhook timeout |
+| `TEMP_ACTIVITY_DELTA_F` | 1.0 | Temperature change counted as activity |
+| `USB_POWER_PRESENT_MV` | 4000 | VBUS threshold that prevents/wakes sleep |
 | `RESTART_DELAY_MS` | 2500 | Delay before reboot after emissivity save |
 
 ### Joystick
@@ -341,10 +350,42 @@ Enable **Debug: ON** in Settings. At 115200 baud you will see:
 | MLX init failed | Hub channel 5, wiring, sensor address `0x5A`, Port A power |
 | WiFi `--` | `secrets.h`, signal, 10 s connect timeout; reconnect every 5 s cooldown |
 | Fan webhook fails | URL in `secrets.h`, HTTP 2xx expected, serial debug for code |
+| Fan display disagrees with reality | Current firmware remembers successful toggles; it does not query the physical fan state |
 | Sleep right after use | Ensure latest firmware (idle timer underflow fix) |
 | Emissivity change needs reboot | By design; wait for automatic restart |
 | UI clipped / overlapping | Live tab uses fixed layout; rebuild after UI changes |
 | Power off won’t return | Normal — use hardware **power button** on CoreS3 |
+
+For a complete post-flash procedure, see [docs/FLASH_AND_SMOKE_TEST.md](docs/FLASH_AND_SMOKE_TEST.md).
+
+---
+
+## Release status
+
+The current release build was successfully written to a CoreS3 on **COM3** with esptool verification and a hard reset. The release build uses **43.2% RAM** (141,684 / 327,680 bytes) and **21.7% flash** (1,419,669 / 6,553,600 bytes).
+
+Verified by build or source inspection:
+
+- M5Unified charging APIs compile for the CoreS3 AXP2101 at 4.20 V / 500 mA.
+- USB VBUS gates idle sleep and is checked during battery sleep polling.
+- Fan HTTP work runs outside the main UI loop with atomic duplicate-request protection.
+- Unused LVGL logging, Lottie, QR, vector/ThorVG, examples, and demos are disabled.
+- `include/secrets.h` remains ignored and was not committed.
+
+Still requiring physical observation after a flash:
+
+- Actual battery charge current and full-charge termination.
+- USB plug/unplug behavior across a full two-minute idle cycle.
+- Real fan response and agreement between the displayed state and the physical fan.
+- Sensor, joystick, alert sound, and touch behavior in the final enclosure.
+
+---
+
+## Performance and roadmap
+
+The firmware has ample flash headroom. The highest-value next optimization is reducing unnecessary I2C traffic—especially PMIC battery reads on every main-loop pass—rather than removing more UI code.
+
+See [docs/PERFORMANCE_AND_ROADMAP.md](docs/PERFORMANCE_AND_ROADMAP.md) for prioritized performance work, reliability improvements, and feature ideas.
 
 ---
 

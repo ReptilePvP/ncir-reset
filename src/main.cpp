@@ -2,6 +2,8 @@
 #include <Wire.h>
 #include <math.h>
 #include <float.h>
+#include <atomic>
+#include <string.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 
@@ -63,6 +65,8 @@ static constexpr uint32_t HTTP_TIMEOUT_MS = 5000;
 static constexpr uint32_t FAN_NOTICE_CLEAR_MS = 3000;
 static constexpr uint32_t IDLE_SLEEP_TIMEOUT_MS = 120000;
 static constexpr int IDLE_JOY_ACTIVITY_THRESH = 20;
+static constexpr float TEMP_ACTIVITY_DELTA_F = 1.0f;
+static constexpr int USB_POWER_PRESENT_MV = 4000;
 static constexpr uint64_t SLEEP_POLL_US = 200000;
 
 // -----------------------------
@@ -137,9 +141,12 @@ static bool use_fahrenheit = true;
 static int current_tab = 0;
 static constexpr int TAB_COUNT = 5;
 static constexpr int LIVE_TAB_INDEX = 0;
+static constexpr int STATS_TAB_INDEX = 1;
 static constexpr int SETTINGS_TAB_INDEX = 2;
 static constexpr int ALERTS_TAB_INDEX = 3;
 static constexpr int CALIBRATION_TAB_INDEX = 4;
+static constexpr uint16_t BATTERY_CHARGE_CURRENT_MA = 500;
+static constexpr uint16_t BATTERY_CHARGE_VOLTAGE_MV = 4200;
 
 static int refresh_options_ms[] = {35, 60, 100, 150};
 static int refresh_index = 1;  // 60 ms default
@@ -229,15 +236,19 @@ static uint32_t last_wifi_attempt_ms = 0;
 
 static bool fan_on = false;
 static bool fan_state_known = false;
-static bool fan_request_in_progress = false;
+static std::atomic_bool fan_request_in_progress{false};
 static char fan_notice_text[48] = "";
 static uint32_t fan_notice_set_ms = 0;
 
 static bool device_sleeping = false;
 static uint32_t last_activity_ms = 0;
 static uint32_t wake_cooldown_until_ms = 0;
+static bool temp_activity_baseline_valid = false;
+static float last_activity_temp_f = 0.0f;
 
 static void update_ui();
+static void note_user_activity();
+static void note_temperature_activity(float temp_f);
 
 // -----------------------------
 // Helpers
@@ -312,6 +323,7 @@ static bool read_temps() {
   ambient_temp_f += calibration_offset_f;
   object_temp_c = (object_temp_f - 32.0f) * (5.0f / 9.0f);
   ambient_temp_c = (ambient_temp_f - 32.0f) * (5.0f / 9.0f);
+  note_temperature_activity(object_temp_f);
 
   if (debug_enabled) {
     Serial.printf("Adjusted temps: object=%.2fF ambient=%.2fF offset=%.1fF\n",
@@ -397,13 +409,27 @@ static void save_preferences() {
     return;
   }
 
-  prefs.putBool(PREF_USE_FAHRENHEIT, use_fahrenheit);
-  prefs.putInt(PREF_REFRESH_INDEX, refresh_index);
-  prefs.putFloat(PREF_EMISSIVITY, current_emissivity);
-  prefs.putBool(PREF_ALERTS_ENABLED, alerts_enabled);
-  prefs.putFloat(PREF_ALERT_THRESHOLD_F, alert_threshold_f);
-  prefs.putFloat(PREF_CAL_OFFSET_F, calibration_offset_f);
-  prefs.putBool(PREF_DEBUG_ENABLED, debug_enabled);
+  if (prefs.getBool(PREF_USE_FAHRENHEIT, !use_fahrenheit) != use_fahrenheit) {
+    prefs.putBool(PREF_USE_FAHRENHEIT, use_fahrenheit);
+  }
+  if (prefs.getInt(PREF_REFRESH_INDEX, -1) != refresh_index) {
+    prefs.putInt(PREF_REFRESH_INDEX, refresh_index);
+  }
+  if (fabsf(prefs.getFloat(PREF_EMISSIVITY, -1.0f) - current_emissivity) > 0.0001f) {
+    prefs.putFloat(PREF_EMISSIVITY, current_emissivity);
+  }
+  if (prefs.getBool(PREF_ALERTS_ENABLED, !alerts_enabled) != alerts_enabled) {
+    prefs.putBool(PREF_ALERTS_ENABLED, alerts_enabled);
+  }
+  if (fabsf(prefs.getFloat(PREF_ALERT_THRESHOLD_F, -1.0f) - alert_threshold_f) > 0.0001f) {
+    prefs.putFloat(PREF_ALERT_THRESHOLD_F, alert_threshold_f);
+  }
+  if (fabsf(prefs.getFloat(PREF_CAL_OFFSET_F, FLT_MAX) - calibration_offset_f) > 0.0001f) {
+    prefs.putFloat(PREF_CAL_OFFSET_F, calibration_offset_f);
+  }
+  if (prefs.getBool(PREF_DEBUG_ENABLED, !debug_enabled) != debug_enabled) {
+    prefs.putBool(PREF_DEBUG_ENABLED, debug_enabled);
+  }
   prefs.end();
 }
 
@@ -523,9 +549,27 @@ static uint32_t ms_since_last_activity() {
   return 0;
 }
 
+static bool usb_power_present() {
+  return M5.Power.getVBUSVoltage() >= USB_POWER_PRESENT_MV;
+}
+
 static bool idle_sleep_timeout_elapsed() {
   if (millis() < wake_cooldown_until_ms) return false;
+  if (usb_power_present()) return false;
   return ms_since_last_activity() >= IDLE_SLEEP_TIMEOUT_MS;
+}
+
+static void note_temperature_activity(float temp_f) {
+  if (!temp_activity_baseline_valid) {
+    last_activity_temp_f = temp_f;
+    temp_activity_baseline_valid = true;
+    return;
+  }
+
+  if (fabsf(temp_f - last_activity_temp_f) >= TEMP_ACTIVITY_DELTA_F) {
+    last_activity_temp_f = temp_f;
+    note_user_activity();
+  }
 }
 
 static bool joystick_has_activity(int x, int y, bool pressed) {
@@ -533,6 +577,15 @@ static bool joystick_has_activity(int x, int y, bool pressed) {
   if (abs(x) > IDLE_JOY_ACTIVITY_THRESH) return true;
   if (abs(y) > IDLE_JOY_ACTIVITY_THRESH) return true;
   return false;
+}
+
+static void set_label_text_if_changed(lv_obj_t* label, const char* text) {
+  if (label == nullptr) return;
+
+  const char* current = lv_label_get_text(label);
+  if (current == nullptr || strcmp(current, text) != 0) {
+    lv_label_set_text(label, text);
+  }
 }
 
 static bool touch_has_activity() {
@@ -569,6 +622,11 @@ static void handle_sleep_mode() {
   while (device_sleeping) {
     M5.update();
 
+    if (usb_power_present()) {
+      wake_from_sleep();
+      return;
+    }
+
     uint8_t raw_x = JOY_CENTER;
     uint8_t raw_y = JOY_CENTER;
     bool pressed = false;
@@ -600,15 +658,9 @@ static void power_off_device() {
   M5.Power.powerOff();
 }
 
-static void toggle_fan_webhook() {
-  if (fan_request_in_progress) return;
-
-  fan_request_in_progress = true;
-  set_fan_notice("Sending...");
-
+static void perform_fan_webhook_request() {
   if (!ensure_wifi_connected()) {
     set_fan_notice("WiFi unavailable");
-    fan_request_in_progress = false;
     return;
   }
 
@@ -616,7 +668,6 @@ static void toggle_fan_webhook() {
   http.setTimeout(HTTP_TIMEOUT_MS);
   if (!http.begin(FAN_WEBHOOK_URL)) {
     set_fan_notice("Bad URL");
-    fan_request_in_progress = false;
     return;
   }
 
@@ -638,8 +689,36 @@ static void toggle_fan_webhook() {
       Serial.printf("Fan webhook failed: %d\n", code);
     }
   }
+}
 
-  fan_request_in_progress = false;
+static void fan_webhook_task(void*) {
+  perform_fan_webhook_request();
+  fan_request_in_progress.store(false, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+static void toggle_fan_webhook() {
+  bool expected = false;
+  if (!fan_request_in_progress.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  set_fan_notice("Sending...");
+
+  BaseType_t started = xTaskCreatePinnedToCore(
+      fan_webhook_task,
+      "fan_webhook",
+      8192,
+      nullptr,
+      1,
+      nullptr,
+      0);
+
+  if (started != pdPASS) {
+    fan_request_in_progress.store(false, std::memory_order_release);
+    set_fan_notice("Request failed");
+  }
 }
 
 static bool read_emissivity_value(float& out_value) {
@@ -935,6 +1014,13 @@ static void build_ui() {
 
 static void update_ui() {
   char buf[96];
+  const lv_color_t selected_color = lv_color_hex(0x22D3EE);
+  const lv_color_t normal_color = lv_color_hex(0x94A3B8);
+  const lv_color_t accent_color = lv_color_hex(0xFCD34D);
+
+  if (tabview != nullptr) {
+    current_tab = clamp_value((int)lv_tabview_get_tab_active(tabview), 0, TAB_COUNT - 1);
+  }
 
   // Battery (all tabs)
   if (battery_level_pct >= 0) {
@@ -942,205 +1028,212 @@ static void update_ui() {
   } else {
     snprintf(buf, sizeof(buf), "--%%");
   }
-  lv_label_set_text(lbl_battery, buf);
+  set_label_text_if_changed(lbl_battery, buf);
 
-  // Live tab
-  snprintf(buf, sizeof(buf), "%d %s", display_object_temp_whole(), current_units_text());
-  lv_label_set_text(lbl_live_temp, buf);
-  lv_obj_set_style_text_color(lbl_live_temp, zone_color_from_temp_f(object_temp_f), 0);
-
-  snprintf(buf, sizeof(buf), "e %.2f", current_emissivity);
-  lv_label_set_text(lbl_live_emissivity, buf);
-
-  if (use_fahrenheit) {
-    lv_bar_set_range(bar_live_temp, 0, 800);
-  } else {
-    lv_bar_set_range(bar_live_temp, 0, 450);
-  }
-  lv_bar_set_value(bar_live_temp, temp_bar_value(), LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(bar_live_temp, zone_color_from_temp_f(object_temp_f), LV_PART_INDICATOR);
-
-  if (live_tab_page != nullptr) {
-    lv_color_t live_bg = alert_visual_active ? lv_color_hex(0x14532D) : lv_color_hex(0x0F172A);
-    lv_obj_set_style_bg_color(live_tab_page, live_bg, 0);
-    lv_obj_set_style_bg_opa(live_tab_page, LV_OPA_COVER, 0);
-  }
-  if (live_hero_panel != nullptr) {
-    lv_color_t border = alert_visual_active ? lv_color_hex(0x4ADE80) : zone_color_from_temp_f(object_temp_f);
-    lv_obj_set_style_border_color(live_hero_panel, border, 0);
-    lv_obj_set_style_border_width(live_hero_panel, alert_visual_active ? 2 : 1, 0);
-  }
-
-  lv_label_set_text(lbl_live_zone, zone_text_from_temp_f(object_temp_f));
-  lv_obj_set_style_text_color(lbl_live_zone, zone_color_from_temp_f(object_temp_f), 0);
-
-  if (fan_state_known) {
-    snprintf(buf, sizeof(buf), "Fan %s", fan_on ? "ON" : "off");
-  } else {
-    snprintf(buf, sizeof(buf), "Fan --");
-  }
-  lv_label_set_text(lbl_live_fan, buf);
-  lv_obj_set_style_text_color(
-      lbl_live_fan,
-      fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
-      0);
-
-  snprintf(buf, sizeof(buf), "WiFi %s", wifi_connected ? "OK" : "--");
-  lv_label_set_text(lbl_live_wifi, buf);
-  lv_obj_set_style_text_color(
-      lbl_live_wifi,
-      wifi_connected ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8),
-      0);
-
-  lv_label_set_text(lbl_live_fan_notice, fan_notice_text);
-  if (fan_notice_text[0] != '\0' && fan_notice_set_ms > 0 &&
+  if (!fan_request_in_progress.load(std::memory_order_acquire) &&
+      fan_notice_text[0] != '\0' && fan_notice_set_ms > 0 &&
       (millis() - fan_notice_set_ms) > FAN_NOTICE_CLEAR_MS) {
     fan_notice_text[0] = '\0';
     fan_notice_set_ms = 0;
-    lv_label_set_text(lbl_live_fan_notice, "");
   }
 
-  // Stats
-  if (successful_reads == 0) {
-    lv_label_set_text(lbl_stats_min, "Min: --");
-    lv_label_set_text(lbl_stats_max, "Max: --");
-  } else {
-    snprintf(buf, sizeof(buf), "Min: %d %s", display_min_temp_whole(), current_units_text());
-    lv_label_set_text(lbl_stats_min, buf);
+  if (current_tab == LIVE_TAB_INDEX) {
+    snprintf(buf, sizeof(buf), "%d %s", display_object_temp_whole(), current_units_text());
+    set_label_text_if_changed(lbl_live_temp, buf);
+    lv_obj_set_style_text_color(lbl_live_temp, zone_color_from_temp_f(object_temp_f), 0);
 
-    snprintf(buf, sizeof(buf), "Max: %d %s", display_max_temp_whole(), current_units_text());
-    lv_label_set_text(lbl_stats_max, buf);
+    snprintf(buf, sizeof(buf), "e %.2f", current_emissivity);
+    set_label_text_if_changed(lbl_live_emissivity, buf);
+
+    if (use_fahrenheit) {
+      lv_bar_set_range(bar_live_temp, 0, 800);
+    } else {
+      lv_bar_set_range(bar_live_temp, 0, 450);
+    }
+    lv_bar_set_value(bar_live_temp, temp_bar_value(), LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar_live_temp, zone_color_from_temp_f(object_temp_f), LV_PART_INDICATOR);
+
+    if (live_tab_page != nullptr) {
+      lv_color_t live_bg = alert_visual_active ? lv_color_hex(0x14532D) : lv_color_hex(0x0F172A);
+      lv_obj_set_style_bg_color(live_tab_page, live_bg, 0);
+      lv_obj_set_style_bg_opa(live_tab_page, LV_OPA_COVER, 0);
+    }
+    if (live_hero_panel != nullptr) {
+      lv_color_t border = alert_visual_active ? lv_color_hex(0x4ADE80) : zone_color_from_temp_f(object_temp_f);
+      lv_obj_set_style_border_color(live_hero_panel, border, 0);
+      lv_obj_set_style_border_width(live_hero_panel, alert_visual_active ? 2 : 1, 0);
+    }
+
+    set_label_text_if_changed(lbl_live_zone, zone_text_from_temp_f(object_temp_f));
+    lv_obj_set_style_text_color(lbl_live_zone, zone_color_from_temp_f(object_temp_f), 0);
+
+    if (fan_state_known) {
+      snprintf(buf, sizeof(buf), "Fan %s", fan_on ? "ON" : "off");
+    } else {
+      snprintf(buf, sizeof(buf), "Fan --");
+    }
+    set_label_text_if_changed(lbl_live_fan, buf);
+    lv_obj_set_style_text_color(
+        lbl_live_fan,
+        fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
+        0);
+
+    snprintf(buf, sizeof(buf), "WiFi %s", wifi_connected ? "OK" : "--");
+    set_label_text_if_changed(lbl_live_wifi, buf);
+    lv_obj_set_style_text_color(
+        lbl_live_wifi,
+        wifi_connected ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8),
+        0);
+
+    set_label_text_if_changed(lbl_live_fan_notice, fan_notice_text);
+    return;
   }
 
-  snprintf(buf, sizeof(buf), "Last: %d %s", display_object_temp_whole(), current_units_text());
-  lv_label_set_text(lbl_stats_last, buf);
+  if (current_tab == STATS_TAB_INDEX) {
+    if (successful_reads == 0) {
+      set_label_text_if_changed(lbl_stats_min, "Min: --");
+      set_label_text_if_changed(lbl_stats_max, "Max: --");
+    } else {
+      snprintf(buf, sizeof(buf), "Min: %d %s", display_min_temp_whole(), current_units_text());
+      set_label_text_if_changed(lbl_stats_min, buf);
 
-  snprintf(buf, sizeof(buf), "Reads: %lu", (unsigned long)successful_reads);
-  lv_label_set_text(lbl_stats_reads, buf);
+      snprintf(buf, sizeof(buf), "Max: %d %s", display_max_temp_whole(), current_units_text());
+      set_label_text_if_changed(lbl_stats_max, buf);
+    }
 
-  // Settings
-  snprintf(buf, sizeof(buf), "Units: %s", current_units_text());
-  lv_label_set_text(lbl_settings_units, buf);
+    snprintf(buf, sizeof(buf), "Last: %d %s", display_object_temp_whole(), current_units_text());
+    set_label_text_if_changed(lbl_stats_last, buf);
 
-  snprintf(buf, sizeof(buf), "Refresh: %d ms", refresh_options_ms[refresh_index]);
-  lv_label_set_text(lbl_settings_refresh, buf);
+    snprintf(buf, sizeof(buf), "Reads: %lu", (unsigned long)successful_reads);
+    set_label_text_if_changed(lbl_stats_reads, buf);
+    return;
+  }
 
-  snprintf(
-      buf,
-      sizeof(buf),
-      "Emissivity: %.2f%s",
-      pending_emissivity,
-      emissivity_edit_mode ? " [edit]" : "");
-  lv_label_set_text(lbl_settings_emissivity, buf);
-  lv_slider_set_value(slider_settings_emissivity, emissivity_to_slider_value(pending_emissivity), LV_ANIM_OFF);
+  if (current_tab == SETTINGS_TAB_INDEX) {
+    snprintf(buf, sizeof(buf), "Units: %s", current_units_text());
+    set_label_text_if_changed(lbl_settings_units, buf);
 
-  snprintf(buf, sizeof(buf), "Debug: %s", debug_enabled ? "ON" : "OFF");
-  lv_label_set_text(lbl_settings_debug, buf);
+    snprintf(buf, sizeof(buf), "Refresh: %d ms", refresh_options_ms[refresh_index]);
+    set_label_text_if_changed(lbl_settings_refresh, buf);
 
-  lv_label_set_text(lbl_settings_notice, settings_notice_text);
+    snprintf(
+        buf,
+        sizeof(buf),
+        "Emissivity: %.2f%s",
+        pending_emissivity,
+        emissivity_edit_mode ? " [edit]" : "");
+    set_label_text_if_changed(lbl_settings_emissivity, buf);
+    lv_slider_set_value(slider_settings_emissivity, emissivity_to_slider_value(pending_emissivity), LV_ANIM_OFF);
 
-  const lv_color_t selected_color = lv_color_hex(0x22D3EE);
-  const lv_color_t normal_color = lv_color_hex(0x94A3B8);
-  const lv_color_t accent_color = lv_color_hex(0xFCD34D);
-  lv_obj_set_style_text_color(
-      lbl_settings_units,
-      selected_settings_row == SETTINGS_ROW_UNITS ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_text_color(
-      lbl_settings_refresh,
-      selected_settings_row == SETTINGS_ROW_REFRESH ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_text_color(
-      lbl_settings_emissivity,
-      selected_settings_row == SETTINGS_ROW_EMISSIVITY ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_text_color(
-      lbl_settings_debug,
-      selected_settings_row == SETTINGS_ROW_DEBUG ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_text_color(
-      lbl_settings_power_off,
-      selected_settings_row == SETTINGS_ROW_POWER_OFF ? lv_color_hex(0xF87171) : lv_color_hex(0x94A3B8),
-      0);
-  lv_obj_set_style_bg_color(
-      slider_settings_emissivity,
-      selected_settings_row == SETTINGS_ROW_EMISSIVITY ? accent_color : normal_color,
-      LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(
-      slider_settings_emissivity,
-      emissivity_edit_mode ? accent_color : lv_color_hex(0x334155),
-      LV_PART_KNOB);
-  lv_label_set_text(
-      lbl_settings_hint,
-      emissivity_edit_mode
-          ? "Up/Down: adjust emissivity\nPress: save + restart"
-          : "Idle 2 min: sleep\nLeft/Right: tabs  Up/Down: select\nPress: change / power off");
+    snprintf(buf, sizeof(buf), "Debug: %s", debug_enabled ? "ON" : "OFF");
+    set_label_text_if_changed(lbl_settings_debug, buf);
 
-  // Alerts
-  snprintf(buf, sizeof(buf), "Alerts: %s", alerts_enabled ? "ON" : "OFF");
-  lv_label_set_text(lbl_alerts_enabled, buf);
+    set_label_text_if_changed(lbl_settings_notice, settings_notice_text);
 
-  snprintf(
-      buf,
-      sizeof(buf),
-      "Threshold: %d %s%s",
-      display_alert_threshold_whole(),
-      current_units_text(),
-      alert_threshold_edit_mode ? " [edit]" : "");
-  lv_label_set_text(lbl_alerts_threshold, buf);
-  lv_slider_set_value(slider_alerts_threshold, threshold_f_to_slider_value(pending_alert_threshold_f), LV_ANIM_OFF);
-  lv_label_set_text(lbl_alerts_notice, alerts_notice_text);
+    lv_obj_set_style_text_color(
+        lbl_settings_units,
+        selected_settings_row == SETTINGS_ROW_UNITS ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_text_color(
+        lbl_settings_refresh,
+        selected_settings_row == SETTINGS_ROW_REFRESH ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_text_color(
+        lbl_settings_emissivity,
+        selected_settings_row == SETTINGS_ROW_EMISSIVITY ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_text_color(
+        lbl_settings_debug,
+        selected_settings_row == SETTINGS_ROW_DEBUG ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_text_color(
+        lbl_settings_power_off,
+        selected_settings_row == SETTINGS_ROW_POWER_OFF ? lv_color_hex(0xF87171) : lv_color_hex(0x94A3B8),
+        0);
+    lv_obj_set_style_bg_color(
+        slider_settings_emissivity,
+        selected_settings_row == SETTINGS_ROW_EMISSIVITY ? accent_color : normal_color,
+        LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(
+        slider_settings_emissivity,
+        emissivity_edit_mode ? accent_color : lv_color_hex(0x334155),
+        LV_PART_KNOB);
+    set_label_text_if_changed(
+        lbl_settings_hint,
+        emissivity_edit_mode
+            ? "Up/Down: adjust emissivity\nPress: save + restart"
+            : "Battery idle 2 min: sleep\nLeft/Right: tabs  Up/Down: select\nPress: change / power off");
+    return;
+  }
 
-  lv_obj_set_style_text_color(
-      lbl_alerts_enabled,
-      selected_alerts_row == ALERTS_ROW_ENABLED ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_text_color(
-      lbl_alerts_threshold,
-      selected_alerts_row == ALERTS_ROW_THRESHOLD ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_bg_color(
-      slider_alerts_threshold,
-      selected_alerts_row == ALERTS_ROW_THRESHOLD ? accent_color : normal_color,
-      LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(
-      slider_alerts_threshold,
-      alert_threshold_edit_mode ? accent_color : lv_color_hex(0x334155),
-      LV_PART_KNOB);
-  lv_label_set_text(
-      lbl_alerts_hint,
-      alert_threshold_edit_mode
-          ? "Up/Down: adjust threshold\nPress: apply alert threshold"
-          : "Left/Right: tabs\nUp/Down: select alert item\nPress: change/apply");
+  if (current_tab == ALERTS_TAB_INDEX) {
+    snprintf(buf, sizeof(buf), "Alerts: %s", alerts_enabled ? "ON" : "OFF");
+    set_label_text_if_changed(lbl_alerts_enabled, buf);
 
-  // Calibration
-  snprintf(
-      buf,
-      sizeof(buf),
-      "Offset: %+d %s%s",
-      display_calibration_offset_whole(),
-      current_units_text(),
-      calibration_edit_mode ? " [edit]" : "");
-  lv_label_set_text(lbl_calibration_offset, buf);
-  lv_slider_set_value(slider_calibration_offset, calibration_offset_to_slider_value(pending_calibration_offset_f), LV_ANIM_OFF);
-  lv_label_set_text(lbl_calibration_notice, calibration_notice_text);
-  lv_obj_set_style_text_color(
-      lbl_calibration_offset,
-      selected_calibration_row == CALIBRATION_ROW_OFFSET ? selected_color : normal_color,
-      0);
-  lv_obj_set_style_bg_color(
-      slider_calibration_offset,
-      selected_calibration_row == CALIBRATION_ROW_OFFSET ? accent_color : normal_color,
-      LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(
-      slider_calibration_offset,
-      calibration_edit_mode ? accent_color : lv_color_hex(0x334155),
-      LV_PART_KNOB);
-  lv_label_set_text(
-      lbl_calibration_hint,
-      calibration_edit_mode
-          ? "Up/Down: adjust offset\nPress: apply calibration"
-          : "Left/Right: tabs\nUp/Down: select item\nPress: change/apply");
+    snprintf(
+        buf,
+        sizeof(buf),
+        "Threshold: %d %s%s",
+        display_alert_threshold_whole(),
+        current_units_text(),
+        alert_threshold_edit_mode ? " [edit]" : "");
+    set_label_text_if_changed(lbl_alerts_threshold, buf);
+    lv_slider_set_value(slider_alerts_threshold, threshold_f_to_slider_value(pending_alert_threshold_f), LV_ANIM_OFF);
+    set_label_text_if_changed(lbl_alerts_notice, alerts_notice_text);
+
+    lv_obj_set_style_text_color(
+        lbl_alerts_enabled,
+        selected_alerts_row == ALERTS_ROW_ENABLED ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_text_color(
+        lbl_alerts_threshold,
+        selected_alerts_row == ALERTS_ROW_THRESHOLD ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_bg_color(
+        slider_alerts_threshold,
+        selected_alerts_row == ALERTS_ROW_THRESHOLD ? accent_color : normal_color,
+        LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(
+        slider_alerts_threshold,
+        alert_threshold_edit_mode ? accent_color : lv_color_hex(0x334155),
+        LV_PART_KNOB);
+    set_label_text_if_changed(
+        lbl_alerts_hint,
+        alert_threshold_edit_mode
+            ? "Up/Down: adjust threshold\nPress: apply alert threshold"
+            : "Left/Right: tabs\nUp/Down: select alert item\nPress: change/apply");
+    return;
+  }
+
+  if (current_tab == CALIBRATION_TAB_INDEX) {
+    snprintf(
+        buf,
+        sizeof(buf),
+        "Offset: %+d %s%s",
+        display_calibration_offset_whole(),
+        current_units_text(),
+        calibration_edit_mode ? " [edit]" : "");
+    set_label_text_if_changed(lbl_calibration_offset, buf);
+    lv_slider_set_value(slider_calibration_offset, calibration_offset_to_slider_value(pending_calibration_offset_f), LV_ANIM_OFF);
+    set_label_text_if_changed(lbl_calibration_notice, calibration_notice_text);
+    lv_obj_set_style_text_color(
+        lbl_calibration_offset,
+        selected_calibration_row == CALIBRATION_ROW_OFFSET ? selected_color : normal_color,
+        0);
+    lv_obj_set_style_bg_color(
+        slider_calibration_offset,
+        selected_calibration_row == CALIBRATION_ROW_OFFSET ? accent_color : normal_color,
+        LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(
+        slider_calibration_offset,
+        calibration_edit_mode ? accent_color : lv_color_hex(0x334155),
+        LV_PART_KNOB);
+    set_label_text_if_changed(
+        lbl_calibration_hint,
+        calibration_edit_mode
+            ? "Up/Down: adjust offset\nPress: apply calibration"
+            : "Left/Right: tabs\nUp/Down: select item\nPress: change/apply");
+  }
 }
 
 // -----------------------------
@@ -1327,10 +1420,12 @@ static void handle_joystick_navigation() {
   bool pressed = false;
 
   if (!read_joystick2_raw(rawX, rawY, pressed)) return;
-  note_user_activity();
 
   int x = (int)rawX - JOY_CENTER;
   int y = JOY_CENTER - (int)rawY;  // invert so up is positive-ish
+  if (joystick_has_activity(x, y, pressed)) {
+    note_user_activity();
+  }
 
   filtered_x = (filtered_x * (JOY_FILTER_DIV - 1) + x) / JOY_FILTER_DIV;
   filtered_y = (filtered_y * (JOY_FILTER_DIV - 1) + y) / JOY_FILTER_DIV;
@@ -1438,6 +1533,9 @@ void setup() {
   auto cfg = M5.config();
   cfg.output_power = true;
   M5.begin(cfg);
+  M5.Power.setBatteryCharge(true);
+  M5.Power.setChargeCurrent(BATTERY_CHARGE_CURRENT_MA);
+  M5.Power.setChargeVoltage(BATTERY_CHARGE_VOLTAGE_MV);
   M5.Power.setExtOutput(true);
   M5.Speaker.setVolume(64);
 
@@ -1445,7 +1543,13 @@ void setup() {
   Serial.println("M5Stack CoreS3 started");
   Serial.printf("PortA I2C pins SDA=%d SCL=%d\n", PORTA_SDA, PORTA_SCL);
   Serial.printf("External port power: %s\n", M5.Power.getExtOutput() ? "ON" : "OFF");
-  Serial.printf("Battery: %d%%  VBUS: %dmV\n", M5.Power.getBatteryLevel(), M5.Power.getVBUSVoltage());
+  Serial.printf("Battery charge: enabled, %umA, %umV\n", BATTERY_CHARGE_CURRENT_MA, BATTERY_CHARGE_VOLTAGE_MV);
+  Serial.printf(
+      "Battery: %d%%  BAT: %dmV  VBUS: %dmV  present: %s\n",
+      M5.Power.getBatteryLevel(),
+      M5.Power.getBatteryVoltage(),
+      M5.Power.getVBUSVoltage(),
+      M5.Power.Axp2101.getBatState() ? "yes" : "no");
 
   Wire.begin(PORTA_SDA, PORTA_SCL, I2C_FREQ);
   load_preferences();
@@ -1481,6 +1585,9 @@ void setup() {
 
 void loop() {
   M5.update();
+  if (touch_has_activity()) {
+    note_user_activity();
+  }
 
   uint32_t now = millis();
 
@@ -1490,7 +1597,7 @@ void loop() {
   }
 
   battery_level_pct = M5.Power.getBatteryLevel();
-  battery_charging = M5.Power.isCharging();
+  battery_charging = M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
 
   if (now - last_lv_tick >= LV_TICK_MS) {
     lv_tick_inc(now - last_lv_tick);
@@ -1502,17 +1609,17 @@ void loop() {
     last_joy_update = now;
   }
 
+  if (sensor_ok && (now - last_temp_update >= (uint32_t)refresh_options_ms[refresh_index])) {
+    temp_valid = read_temps();
+    last_temp_update = now;
+  }
+
   if (!restart_pending && !any_edit_mode_active() && idle_sleep_timeout_elapsed()) {
     enter_sleep_mode();
     if (device_sleeping) {
       handle_sleep_mode();
       return;
     }
-  }
-
-  if (sensor_ok && (now - last_temp_update >= (uint32_t)refresh_options_ms[refresh_index])) {
-    temp_valid = read_temps();
-    last_temp_update = now;
   }
 
   handle_temperature_alert(now);
