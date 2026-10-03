@@ -4,7 +4,7 @@ Use this checklist for release builds of the NCIR Reset firmware. Do not record 
 
 ## Before flashing
 
-1. Confirm `include/secrets.h` exists and contains non-placeholder values for `WIFI_SSID`, `WIFI_PASS`, and `FAN_WEBHOOK_URL`.
+1. Confirm `include/secrets.h` exists and contains non-placeholder values for `WIFI_SSID`, `WIFI_PASS`, `FAN_WEBHOOK_URL`, and `SMOKE_FAN_WEBHOOK_URL`.
 2. Confirm `include/secrets.h` is ignored:
 
    ```powershell
@@ -43,24 +43,40 @@ The flash passes only when esptool reports `Hash of data verified` for every seg
 2. Disconnect USB and hold the measured scene steady. After two minutes without qualifying activity, the display should sleep.
 3. Wake with touch and then with joystick input in separate trials.
 4. Let the device sleep on battery, then connect USB. It should wake during the 200 ms sleep-poll cycle.
-5. Confirm that a temperature change of at least 1 °F resets the idle timer.
+5. Confirm that a temperature change of at least 1 Ã‚Â°F resets the idle timer.
 
 ### Fan webhook responsiveness
 
-1. On the Live tab, press the joystick button.
+1. On the Live tab, select Fan or Smoke Fan with Up/Down, then press the joystick button.
 2. `Sending...` should appear immediately and the UI should continue updating.
 3. Additional presses during the request must not start duplicate requests.
 4. A successful HTTP 2xx response should show `Fan ON` or `Fan OFF`.
 5. Confirm the physical fan changed state; the displayed state is only a local record of successful toggles.
-6. Repeat once with WiFi unavailable and confirm the UI remains usable through the bounded reconnect/HTTP path.
+6. Repeat for both controls, then once with WiFi unavailable and confirm the UI remains usable through the bounded reconnect/HTTP path.
 
 ### Alerts and settings
 
 - Enable an alert and cross the threshold; verify the two-tone alert and green highlight.
-- Drop at least 5 °F below the threshold; verify hysteresis clears the alert.
+- Drop at least 5 Ã‚Â°F below the threshold; verify hysteresis clears the alert.
 - Change units, refresh interval, calibration, and debug; reboot and confirm persistence.
 - Change emissivity only with a suitable target/reference, then verify the scheduled reboot completes.
-- Use Settings → Power off and confirm the hardware power button restores operation.
+- Use Settings Ã¢â€ â€™ Power off and confirm the hardware power button restores operation.
+
+## Lift regression and guarded bench trial
+
+Compile `test/lift_control_test.cpp` with a host C++17 compiler and `-Iinclude`, then run it. The fake writer checks inverse kinematics, pulse mapping, direct targets, 20 ms scheduling, 1/5 mm joystick selection, holding beyond the former timeout, release, every enable-write failure, disconnect/reconnect, lockout, optional bench sweep and rollover.
+
+For hardware checks, follow [NCIR_LIFT.md](NCIR_LIFT.md). Start unloaded with a verified ME-X8 V1 positional servo and appropriate U165 supply. Enable centers immediately. Support the carriage before release or disconnection. Narrow travel before the first assembled trial. Confirm direction, actual low/middle/high height, clearances, supply stability and UI responsiveness. Verify idle sleep remains inhibited while holding or release is unconfirmed, then resumes after release. Controller acknowledgement is not position feedback.
+
+## Current checkout evidence â€” 2026-10-02
+
+- PlatformIO `m5stack-cores3` release build: SUCCESS.
+- RAM: 141,748 / 327,680 bytes (43.3%).
+- Flash: 1,424,969 / 6,553,600 bytes (21.7%).
+- Existing host regression executable passed; its timestamp follows the unchanged controller/test source. It was not rebuilt during this documentation update.
+- Firmware binary SHA-256: `87125cd45626f68cc439e4d4a66719ad624b132b7f2e52f94ef9d1451dc0f3d0`.
+- No upload performed during this documentation update. Earlier COM3 uploads are historical records in the lift guide.
+- Loaded lift travel, actual speed, supply transients, battery behavior, alert audio and physical webhook effects require observation.
 
 ## Release evidence
 

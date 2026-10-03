@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <math.h>
 #include <float.h>
+#include <stdint.h>
 #include <atomic>
 #include <string.h>
 #include <WiFi.h>
@@ -12,6 +13,7 @@
 #include "lv_conf.h"
 #include <lvgl.h>
 #include <Adafruit_MLX90614.h>
+#include "lift_control.h"
 
 // -----------------------------
 // CoreS3 / Port A I2C
@@ -56,7 +58,7 @@ static constexpr uint32_t JOY_NAV_REPEAT_MS = 220;
 static constexpr uint32_t JOY_BUTTON_DEBOUNCE_MS = 220;
 static constexpr uint32_t RESTART_DELAY_MS = 2500;
 
-// WiFi / fan webhook
+// WiFi / device webhooks
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 static constexpr uint32_t WIFI_RECONNECT_TIMEOUT_MS = 8000;
 static constexpr uint32_t WIFI_RECONNECT_COOLDOWN_MS = 5000;
@@ -84,12 +86,17 @@ static lv_obj_t* live_hero_panel = nullptr;
 static lv_obj_t* lbl_live_temp = nullptr;
 static lv_obj_t* bar_live_temp = nullptr;
 static lv_obj_t* lbl_live_zone = nullptr;
+static lv_obj_t* btn_live_fan = nullptr;
 static lv_obj_t* lbl_live_fan = nullptr;
+static lv_obj_t* btn_live_smoke_fan = nullptr;
+static lv_obj_t* lbl_live_smoke_fan = nullptr;
 static lv_obj_t* lbl_live_wifi = nullptr;
 static lv_obj_t* lbl_live_emissivity = nullptr;
 static lv_obj_t* lbl_live_fan_notice = nullptr;
 static lv_obj_t* lbl_live_hint = nullptr;
 static lv_obj_t* lbl_battery = nullptr;
+static lv_obj_t* lbl_lift_status = nullptr;
+static lv_obj_t* lbl_lift_position = nullptr;
 
 // Stats tab
 static lv_obj_t* lbl_stats_min = nullptr;
@@ -139,12 +146,13 @@ static bool sensor_ok = false;
 static bool use_fahrenheit = true;
 
 static int current_tab = 0;
-static constexpr int TAB_COUNT = 5;
+static constexpr int TAB_COUNT = 6;
 static constexpr int LIVE_TAB_INDEX = 0;
 static constexpr int STATS_TAB_INDEX = 1;
 static constexpr int SETTINGS_TAB_INDEX = 2;
 static constexpr int ALERTS_TAB_INDEX = 3;
 static constexpr int CALIBRATION_TAB_INDEX = 4;
+static constexpr int LIFT_TAB_INDEX = 5;
 static constexpr uint16_t BATTERY_CHARGE_CURRENT_MA = 500;
 static constexpr uint16_t BATTERY_CHARGE_VOLTAGE_MV = 4200;
 
@@ -156,8 +164,17 @@ static constexpr int EMISSIVITY_SLIDER_STEP = 1;
 static constexpr int ALERT_THRESHOLD_MIN_F = 100;
 static constexpr int ALERT_THRESHOLD_MAX_F = 800;
 static constexpr int ALERT_THRESHOLD_STEP_F = 5;
-static constexpr float ALERT_HYSTERESIS_F = 5.0f;
-static constexpr uint32_t ALERT_TONE_COOLDOWN_MS = 1500;
+struct AlertNote {
+  uint16_t frequency_hz;
+  uint16_t duration_ms;
+};
+// A short ascending C-major jingle, with a longer final note.
+static constexpr AlertNote ALERT_JINGLE[] = {
+    {1047, 180}, {1319, 180}, {1568, 180}, {2093, 420}};
+static constexpr uint32_t ALERT_NOTE_GAP_MS = 60;
+static size_t alert_note_index = 0;
+static uint32_t alert_note_started_ms = 0;
+static bool alert_jingle_playing = false;
 static constexpr int CALIBRATION_OFFSET_MIN_F = -150;
 static constexpr int CALIBRATION_OFFSET_MAX_F = 150;
 static constexpr int CALIBRATION_OFFSET_STEP_F = 5;
@@ -182,7 +199,14 @@ enum CalibrationRow {
   CALIBRATION_ROW_COUNT = 1
 };
 
+enum LiveRow {
+  LIVE_ROW_FAN = 0,
+  LIVE_ROW_SMOKE_FAN = 1,
+  LIVE_ROW_COUNT = 2
+};
+
 static int selected_settings_row = SETTINGS_ROW_UNITS;
+static int selected_live_row = LIVE_ROW_FAN;
 static float current_emissivity = 0.95f;
 static float pending_emissivity = 0.95f;
 static bool emissivity_edit_mode = false;
@@ -194,7 +218,6 @@ static float pending_alert_threshold_f = 450.0f;
 static bool alert_threshold_edit_mode = false;
 static bool alert_triggered = false;
 static bool alert_visual_active = false;
-static uint32_t last_alert_tone_ms = 0;
 static int selected_calibration_row = CALIBRATION_ROW_OFFSET;
 static float calibration_offset_f = 0.0f;
 static float pending_calibration_offset_f = 0.0f;
@@ -236,7 +259,9 @@ static uint32_t last_wifi_attempt_ms = 0;
 
 static bool fan_on = false;
 static bool fan_state_known = false;
-static std::atomic_bool fan_request_in_progress{false};
+static bool smoke_fan_on = false;
+static bool smoke_fan_state_known = false;
+static std::atomic_bool webhook_request_in_progress{false};
 static char fan_notice_text[48] = "";
 static uint32_t fan_notice_set_ms = 0;
 
@@ -266,6 +291,42 @@ static bool pahub_select(uint8_t ch) {
   bool ok = (Wire.endTransmission() == 0);
   delay(2);
   return ok;
+}
+
+static_assert(lift_config::hub_channel != PAHUB_JOY_CH &&
+              lift_config::hub_channel != PAHUB_MLX_CH, "Use a free Pa.Hub port for lift");
+static bool write_lift_register(uint8_t reg, uint16_t value, uint8_t length) {
+  if (!pahub_select(lift_config::hub_channel)) return false;
+  Wire.beginTransmission(lift_config::address);
+  Wire.write(reg);
+  Wire.write((uint8_t)(value & 0xff));
+  if (length == 2) Wire.write((uint8_t)(value >> 8));
+  return Wire.endTransmission() == 0;
+}
+static LiftControl lift(write_lift_register);
+
+static void log_lift_readback(const char* stage) {
+  uint16_t values[2] = {0, 0};
+  bool ok = true;
+  const uint8_t regs[] = {lift_config::servo_channel,
+                         (uint8_t)(0x60 + 2 * lift_config::servo_channel)};
+  for (int i = 0; i < 2 && ok; ++i) {
+    ok = pahub_select(lift_config::hub_channel);
+    if (!ok) break;
+    Wire.beginTransmission(lift_config::address);
+    Wire.write(regs[i]);
+    ok = Wire.endTransmission(false) == 0;
+    if (!ok) break;
+    const uint8_t length = i == 0 ? 1 : 2;
+    ok = Wire.requestFrom(lift_config::address, length) == length;
+    if (ok) {
+      values[i] = Wire.read();
+      if (length == 2) values[i] |= (uint16_t)Wire.read() << 8;
+    }
+  }
+  Serial.printf("Lift ME-X8 %s: enabled=%d fault=%d release_unconfirmed=%d commanded=%d hub=%u output=%u read_ok=%d mode=%u pulse_us=%u\n",
+      stage, lift.enabled, lift.fault, lift.release_unconfirmed, lift.commanded_deg,
+      lift_config::hub_channel, lift_config::servo_channel, ok, values[0], values[1]);
 }
 
 static bool read_joystick2_raw(uint8_t& x, uint8_t& y, bool& pressed) {
@@ -460,18 +521,32 @@ static void load_preferences() {
   pending_calibration_offset_f = calibration_offset_f;
 }
 
-static void play_alert_tone() {
+static void play_alert_jingle() {
   if (M5.Speaker.isEnabled()) {
-    M5.Speaker.tone(1800, 180);
+    alert_note_index = 0;
+    alert_note_started_ms = millis();
+    alert_jingle_playing = true;
+    M5.Speaker.tone(ALERT_JINGLE[0].frequency_hz, ALERT_JINGLE[0].duration_ms);
   }
 }
 
-static void play_target_reached_tone() {
-  if (!M5.Speaker.isEnabled()) return;
-
-  M5.Speaker.tone(1600, 120);
-  delay(150);
-  M5.Speaker.tone(2200, 160);
+static void update_alert_jingle() {
+  if (!alert_jingle_playing) return;
+  if (device_sleeping || !alerts_enabled) {
+    M5.Speaker.stop();
+    alert_jingle_playing = false;
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - alert_note_started_ms <
+      ALERT_JINGLE[alert_note_index].duration_ms + ALERT_NOTE_GAP_MS) return;
+  if (++alert_note_index >= sizeof(ALERT_JINGLE) / sizeof(ALERT_JINGLE[0])) {
+    alert_jingle_playing = false;
+    return;
+  }
+  alert_note_started_ms = now;
+  const AlertNote& note = ALERT_JINGLE[alert_note_index];
+  M5.Speaker.tone(note.frequency_hz, note.duration_ms);
 }
 
 static void log_debug_settings_summary() {
@@ -608,9 +683,12 @@ static void wake_from_sleep() {
 }
 
 static void enter_sleep_mode() {
-  if (device_sleeping || restart_pending || any_edit_mode_active()) return;
+  // Keep monitoring the controller while supporting the vertical load.
+  if (device_sleeping || restart_pending || any_edit_mode_active() || lift.enabled ||
+      lift.release_unconfirmed) return;
 
   device_sleeping = true;
+  update_alert_jingle();
   alert_visual_active = false;
   WiFi.disconnect(true);
   wifi_connected = false;
@@ -649,6 +727,7 @@ static void handle_sleep_mode() {
 }
 
 static void power_off_device() {
+  lift.release();
   save_preferences();
   snprintf(settings_notice_text, sizeof(settings_notice_text), "Powering off...");
   update_ui();
@@ -658,15 +737,18 @@ static void power_off_device() {
   M5.Power.powerOff();
 }
 
-static void perform_fan_webhook_request() {
+static void perform_webhook_request(int live_row) {
   if (!ensure_wifi_connected()) {
     set_fan_notice("WiFi unavailable");
     return;
   }
 
+  const bool is_smoke_fan = (live_row == LIVE_ROW_SMOKE_FAN);
+  const char* webhook_url = is_smoke_fan ? SMOKE_FAN_WEBHOOK_URL : FAN_WEBHOOK_URL;
+
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(FAN_WEBHOOK_URL)) {
+  if (!http.begin(webhook_url)) {
     set_fan_notice("Bad URL");
     return;
   }
@@ -676,47 +758,59 @@ static void perform_fan_webhook_request() {
   http.end();
 
   if (code >= 200 && code < 300) {
-    fan_on = !fan_on;
-    fan_state_known = true;
-    set_fan_notice(fan_on ? "Fan ON" : "Fan OFF");
+    bool& device_on = is_smoke_fan ? smoke_fan_on : fan_on;
+    bool& state_known = is_smoke_fan ? smoke_fan_state_known : fan_state_known;
+    device_on = !device_on;
+    state_known = true;
+    set_fan_notice(is_smoke_fan
+                       ? (device_on ? "Smoke Fan ON" : "Smoke Fan OFF")
+                       : (device_on ? "Fan ON" : "Fan OFF"));
     if (debug_enabled) {
-      Serial.printf("Fan webhook OK (%d), fan_on=%d\n", code, fan_on);
+      Serial.printf("%s webhook OK (%d), on=%d\n",
+                    is_smoke_fan ? "Smoke Fan" : "Fan",
+                    code,
+                    device_on);
     }
   } else {
     snprintf(fan_notice_text, sizeof(fan_notice_text), "HTTP %d", code);
     fan_notice_set_ms = millis();
     if (debug_enabled) {
-      Serial.printf("Fan webhook failed: %d\n", code);
+      Serial.printf("%s webhook failed: %d\n",
+                    is_smoke_fan ? "Smoke Fan" : "Fan",
+                    code);
     }
   }
 }
 
-static void fan_webhook_task(void*) {
-  perform_fan_webhook_request();
-  fan_request_in_progress.store(false, std::memory_order_release);
+static void fan_webhook_task(void* task_arg) {
+  const int requested_row = (int)(intptr_t)task_arg;
+  perform_webhook_request(requested_row);
+  webhook_request_in_progress.store(false, std::memory_order_release);
   vTaskDelete(nullptr);
 }
 
-static void toggle_fan_webhook() {
+static void toggle_selected_webhook() {
   bool expected = false;
-  if (!fan_request_in_progress.compare_exchange_strong(
+  if (!webhook_request_in_progress.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
     return;
   }
 
-  set_fan_notice("Sending...");
+  set_fan_notice(selected_live_row == LIVE_ROW_SMOKE_FAN
+                     ? "Sending Smoke Fan..."
+                     : "Sending Fan...");
 
   BaseType_t started = xTaskCreatePinnedToCore(
       fan_webhook_task,
       "fan_webhook",
       8192,
-      nullptr,
+      (void*)(intptr_t)selected_live_row,
       1,
       nullptr,
       0);
 
   if (started != pdPASS) {
-    fan_request_in_progress.store(false, std::memory_order_release);
+    webhook_request_in_progress.store(false, std::memory_order_release);
     set_fan_notice("Request failed");
   }
 }
@@ -796,8 +890,11 @@ static void build_ui() {
   lv_obj_set_style_bg_color(scr, lv_color_hex(0x0F172A), 0);
 
   tabview = lv_tabview_create(scr);
-  lv_obj_set_size(tabview, 320, 240);
-  lv_obj_center(tabview);
+  // Reserve 18 pixels above the tabs for the battery status.
+  lv_obj_set_size(tabview, 320, 222);
+  lv_obj_align(tabview, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_tabview_set_tab_bar_size(tabview, 32);
+  lv_obj_set_style_text_font(lv_tabview_get_tab_bar(tabview), &::lv_font_montserrat_12, 0);
 
   lv_obj_t* tab_live = lv_tabview_add_tab(tabview, "Live");
   live_tab_page = tab_live;
@@ -805,15 +902,38 @@ static void build_ui() {
   lv_obj_t* tab_settings = lv_tabview_add_tab(tabview, "Settings");
   lv_obj_t* tab_alerts = lv_tabview_add_tab(tabview, "Alerts");
   lv_obj_t* tab_calibration = lv_tabview_add_tab(tabview, "Cal");
+  lv_obj_t* tab_lift = lv_tabview_add_tab(tabview, "Lift");
+  lv_obj_set_style_pad_all(tab_lift, 8, 0);
+  lv_obj_set_style_bg_color(tab_lift, lv_color_hex(0x0F172A), 0);
+  lv_obj_set_style_bg_opa(tab_lift, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(tab_lift, lv_color_hex(0xE2E8F0), 0);
+  lv_obj_remove_flag(tab_lift, LV_OBJ_FLAG_SCROLLABLE);
+  lbl_lift_status = lv_label_create(tab_lift);
+  lv_obj_set_width(lbl_lift_status, 300);
+  lv_obj_set_style_text_font(lbl_lift_status, &::lv_font_montserrat_14, 0);
+  lv_obj_set_pos(lbl_lift_status, 0, 0);
+  lbl_lift_position = lv_label_create(tab_lift);
+  lv_obj_set_style_text_font(lbl_lift_position, &::lv_font_montserrat_18, 0);
+  lv_obj_set_pos(lbl_lift_position, 0, 46);
+  lv_obj_t* lift_hint = lv_label_create(tab_lift);
+  lv_obj_set_style_text_font(lift_hint, &::lv_font_montserrat_14, 0);
+  lv_obj_set_pos(lift_hint, 0, 99);
+  lv_label_set_text(lift_hint, lift_config::motion_allowed
+      ? (lift_config::bench_test
+          ? "UNLOADED servo test only\nPress: 90 > 86 > 94 > 90 deg\nAuto-release after 1.5 seconds\nPress while active: release"
+          : "Up/Down: light 1mm / full 5mm\nPress: center / release\nLeft/Right: tabs\nSupport carriage before release")
+      : "Motion disabled for diagnosis\nPress: retry PWM release only\nLeft/Right: tabs\nVerify servo model and power");
 
   lv_obj_set_style_bg_color(tab_live, lv_color_hex(0x0F172A), 0);
   lv_obj_set_style_bg_opa(tab_live, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all(tab_live, 0, 0);
+  lv_obj_set_style_border_width(tab_live, 0, 0);
   lv_obj_remove_flag(tab_live, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Live tab — fixed positions only (no flex / content-sized panels)
+  // Live content is 320 x 190. Every row has its own bounded space.
   live_hero_panel = lv_obj_create(tab_live);
-  lv_obj_set_size(live_hero_panel, 288, 108);
-  lv_obj_align(live_hero_panel, LV_ALIGN_TOP_MID, 0, 6);
+  lv_obj_set_size(live_hero_panel, 304, 80);
+  lv_obj_align(live_hero_panel, LV_ALIGN_TOP_MID, 0, 4);
   lv_obj_set_style_bg_color(live_hero_panel, lv_color_hex(0x1E293B), 0);
   lv_obj_set_style_bg_opa(live_hero_panel, LV_OPA_COVER, 0);
   lv_obj_set_style_border_color(live_hero_panel, lv_color_hex(0x334155), 0);
@@ -825,12 +945,12 @@ static void build_ui() {
   lbl_live_temp = lv_label_create(live_hero_panel);
   lv_obj_set_style_text_font(lbl_live_temp, &::lv_font_montserrat_32, 0);
   lv_obj_set_style_text_color(lbl_live_temp, lv_color_hex(0xE2E8F0), 0);
-  lv_obj_align(lbl_live_temp, LV_ALIGN_TOP_MID, 0, 10);
+  lv_obj_align(lbl_live_temp, LV_ALIGN_TOP_MID, 0, 2);
   lv_label_set_text(lbl_live_temp, "-- F");
 
   bar_live_temp = lv_bar_create(live_hero_panel);
   lv_obj_set_size(bar_live_temp, 256, 10);
-  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_MID, 0, 52);
+  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_MID, 0, 42);
   lv_bar_set_range(bar_live_temp, 0, 800);
   lv_bar_set_value(bar_live_temp, 0, LV_ANIM_OFF);
   lv_obj_set_style_radius(bar_live_temp, 5, 0);
@@ -842,41 +962,65 @@ static void build_ui() {
   lbl_live_zone = lv_label_create(live_hero_panel);
   lv_obj_set_style_text_font(lbl_live_zone, &::lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(lbl_live_zone, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_zone, LV_ALIGN_TOP_MID, 0, 78);
+  lv_obj_align(lbl_live_zone, LV_ALIGN_TOP_MID, 0, 56);
   lv_label_set_text(lbl_live_zone, "--");
 
-  lbl_live_fan = lv_label_create(tab_live);
+  btn_live_fan = lv_button_create(tab_live);
+  lv_obj_set_size(btn_live_fan, 148, 32);
+  lv_obj_align(btn_live_fan, LV_ALIGN_TOP_LEFT, 8, 90);
+  lv_obj_set_style_pad_all(btn_live_fan, 0, 0);
+  lv_obj_set_style_shadow_width(btn_live_fan, 0, 0);
+  lv_obj_set_style_bg_color(btn_live_fan, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_opa(btn_live_fan, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn_live_fan, 8, 0);
+  lv_obj_set_style_border_width(btn_live_fan, 2, 0);
+  lbl_live_fan = lv_label_create(btn_live_fan);
   lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_fan, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_fan, LV_ALIGN_BOTTOM_LEFT, 10, -34);
+  lv_obj_center(lbl_live_fan);
   lv_label_set_text(lbl_live_fan, "Fan --");
+
+  btn_live_smoke_fan = lv_button_create(tab_live);
+  lv_obj_set_size(btn_live_smoke_fan, 148, 32);
+  lv_obj_align(btn_live_smoke_fan, LV_ALIGN_TOP_RIGHT, -8, 90);
+  lv_obj_set_style_pad_all(btn_live_smoke_fan, 0, 0);
+  lv_obj_set_style_shadow_width(btn_live_smoke_fan, 0, 0);
+  lv_obj_set_style_bg_color(btn_live_smoke_fan, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_opa(btn_live_smoke_fan, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn_live_smoke_fan, 8, 0);
+  lv_obj_set_style_border_width(btn_live_smoke_fan, 2, 0);
+  lbl_live_smoke_fan = lv_label_create(btn_live_smoke_fan);
+  lv_obj_set_style_text_font(lbl_live_smoke_fan, &::lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_live_smoke_fan, lv_color_hex(0x94A3B8), 0);
+  lv_obj_center(lbl_live_smoke_fan);
+  lv_label_set_text(lbl_live_smoke_fan, "Smoke Fan --");
 
   lbl_live_wifi = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_wifi, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_wifi, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_wifi, LV_ALIGN_BOTTOM_RIGHT, -10, -34);
+  lv_obj_align(lbl_live_wifi, LV_ALIGN_TOP_RIGHT, -10, 150);
   lv_label_set_text(lbl_live_wifi, "WiFi --");
 
   lbl_live_emissivity = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_emissivity, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_emissivity, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_emissivity, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_obj_align(lbl_live_emissivity, LV_ALIGN_TOP_LEFT, 10, 150);
   lv_label_set_text(lbl_live_emissivity, "e 0.95");
 
   lbl_live_fan_notice = lv_label_create(tab_live);
-  lv_obj_set_width(lbl_live_fan_notice, 280);
+  lv_obj_set_size(lbl_live_fan_notice, 300, 18);
   lv_obj_set_style_text_font(lbl_live_fan_notice, &::lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(lbl_live_fan_notice, lv_color_hex(0xFCD34D), 0);
   lv_obj_set_style_text_align(lbl_live_fan_notice, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(lbl_live_fan_notice, LV_ALIGN_BOTTOM_MID, 0, -50);
-  lv_label_set_long_mode(lbl_live_fan_notice, LV_LABEL_LONG_WRAP);
+  lv_obj_align(lbl_live_fan_notice, LV_ALIGN_TOP_MID, 0, 128);
+  lv_label_set_long_mode(lbl_live_fan_notice, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_label_set_text(lbl_live_fan_notice, "");
 
   lbl_live_hint = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_hint, &::lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(0x475569), 0);
-  lv_obj_align(lbl_live_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
-  lv_label_set_text(lbl_live_hint, "Press: toggle fan");
+  lv_obj_align(lbl_live_hint, LV_ALIGN_TOP_MID, 0, 172);
+  lv_label_set_text(lbl_live_hint, "Up/Down: select   Press: toggle");
 
   // Stats
   lbl_stats_min = lv_label_create(tab_stats);
@@ -1003,17 +1147,26 @@ static void build_ui() {
   lv_obj_align(lbl_calibration_hint, LV_ALIGN_TOP_LEFT, 8, 126);
   lv_label_set_text(lbl_calibration_hint, "Up/Down: adjust offset\nPress: save offset");
 
-  // Battery overlay — visible on every tab
+  // Battery status in its own strip, above every tab.
   lbl_battery = lv_label_create(scr);
   lv_obj_set_style_text_font(lbl_battery, &::lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x64748B), 0);
-  lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -6, 6);
+  lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -6, 1);
   lv_label_set_text(lbl_battery, "--%");
   lv_obj_move_foreground(lbl_battery);
 }
 
 static void update_ui() {
   char buf[96];
+  set_label_text_if_changed(lbl_lift_status,
+      lift.release_unconfirmed ? "I2C fault: release UNCONFIRMED\nSupport lift; check power/cable" :
+      !lift_config::motion_allowed ? "Lift locked - disconnect servo\nCheck servo type and supply" :
+      lift.fault ? "Lift unavailable / I2C fault\nPress to retry at center" :
+      lift_config::bench_test ? (lift.enabled ? "Servo test active (1.5s max)" : "Servo test ready - PWM released") :
+      lift.enabled ? (lift.commanded_deg == LiftControl::angleForHeight(lift.target_mm)
+          ? "Lift holding target" : "Lift moving to target") : "Lift released - press to center");
+  snprintf(buf, sizeof(buf), "Target: %d mm\nCommand: %d deg", lift.target_mm, lift.commanded_deg);
+  set_label_text_if_changed(lbl_lift_position, buf);
   const lv_color_t selected_color = lv_color_hex(0x22D3EE);
   const lv_color_t normal_color = lv_color_hex(0x94A3B8);
   const lv_color_t accent_color = lv_color_hex(0xFCD34D);
@@ -1030,7 +1183,7 @@ static void update_ui() {
   }
   set_label_text_if_changed(lbl_battery, buf);
 
-  if (!fan_request_in_progress.load(std::memory_order_acquire) &&
+  if (!webhook_request_in_progress.load(std::memory_order_acquire) &&
       fan_notice_text[0] != '\0' && fan_notice_set_ms > 0 &&
       (millis() - fan_notice_set_ms) > FAN_NOTICE_CLEAR_MS) {
     fan_notice_text[0] = '\0';
@@ -1076,6 +1229,26 @@ static void update_ui() {
     lv_obj_set_style_text_color(
         lbl_live_fan,
         fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
+        0);
+
+    if (smoke_fan_state_known) {
+      snprintf(buf, sizeof(buf), "Smoke Fan %s", smoke_fan_on ? "ON" : "off");
+    } else {
+      snprintf(buf, sizeof(buf), "Smoke Fan --");
+    }
+    set_label_text_if_changed(lbl_live_smoke_fan, buf);
+    lv_obj_set_style_text_color(
+        lbl_live_smoke_fan,
+        smoke_fan_state_known ? (smoke_fan_on ? lv_color_hex(0x4ADE80) : normal_color) : normal_color,
+        0);
+
+    lv_obj_set_style_border_color(
+        btn_live_fan,
+        selected_live_row == LIVE_ROW_FAN ? selected_color : lv_color_hex(0x334155),
+        0);
+    lv_obj_set_style_border_color(
+        btn_live_smoke_fan,
+        selected_live_row == LIVE_ROW_SMOKE_FAN ? selected_color : lv_color_hex(0x334155),
         0);
 
     snprintf(buf, sizeof(buf), "WiFi %s", wifi_connected ? "OK" : "--");
@@ -1246,6 +1419,7 @@ static void goto_tab(int idx) {
 }
 
 static void schedule_restart_notice(const char* text) {
+  lift.release();
   snprintf(settings_notice_text, sizeof(settings_notice_text), "%s", text);
   restart_pending = true;
   emissivity_edit_mode = false;
@@ -1360,7 +1534,7 @@ static void activate_selected_alert_setting() {
   }
 }
 
-static void handle_temperature_alert(uint32_t now) {
+static void handle_temperature_alert() {
   if (!alerts_enabled || !temp_valid) {
     alert_triggered = false;
     alert_visual_active = false;
@@ -1368,17 +1542,12 @@ static void handle_temperature_alert(uint32_t now) {
   }
 
   if (object_temp_f >= alert_threshold_f) {
-    if (!alert_triggered || (now - last_alert_tone_ms >= ALERT_TONE_COOLDOWN_MS)) {
-      if (!alert_triggered) {
-        play_target_reached_tone();
-        alert_visual_active = true;
-      } else {
-        play_alert_tone();
-      }
-      last_alert_tone_ms = now;
+    if (!alert_triggered) {
       alert_triggered = true;
+      alert_visual_active = true;
+      play_alert_jingle();
     }
-  } else if (object_temp_f <= (alert_threshold_f - ALERT_HYSTERESIS_F)) {
+  } else {
     alert_triggered = false;
     alert_visual_active = false;
   }
@@ -1443,8 +1612,16 @@ static void handle_joystick_navigation() {
     }
   }
 
-  // Settings adjustments with up/down
-  if (current_tab == SETTINGS_TAB_INDEX) {
+  // Live webhook selection and settings adjustments with up/down
+  if (current_tab == LIVE_TAB_INDEX) {
+    if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
+      selected_live_row = clamp_value(selected_live_row - 1, 0, LIVE_ROW_COUNT - 1);
+      last_ud_nav_ms = now;
+    } else if (filtered_y < -JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
+      selected_live_row = clamp_value(selected_live_row + 1, 0, LIVE_ROW_COUNT - 1);
+      last_ud_nav_ms = now;
+    }
+  } else if (current_tab == SETTINGS_TAB_INDEX) {
     if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
       if (emissivity_edit_mode && selected_settings_row == SETTINGS_ROW_EMISSIVITY) {
         int slider_value = emissivity_to_slider_value(pending_emissivity);
@@ -1511,15 +1688,28 @@ static void handle_joystick_navigation() {
   }
 
   // Button
+  if (current_tab == LIFT_TAB_INDEX && lift.enabled && !pressed &&
+      now - last_ud_nav_ms >= lift_config::joystick_repeat_ms) {
+    if (filtered_y > JOY_NAV_V_THRESH || filtered_y < -JOY_NAV_V_THRESH) {
+      const int increment = lift_config::joystickStepMm(filtered_y);
+      lift.target(lift.target_mm + (filtered_y > 0 ? increment : -increment));
+      last_ud_nav_ms = now;
+    }
+  }
   if (pressed && !last_button_pressed && (now - last_button_ms > JOY_BUTTON_DEBOUNCE_MS)) {
     if (current_tab == LIVE_TAB_INDEX) {
-      toggle_fan_webhook();
+      toggle_selected_webhook();
     } else if (current_tab == SETTINGS_TAB_INDEX) {
       activate_selected_setting();
     } else if (current_tab == ALERTS_TAB_INDEX) {
       activate_selected_alert_setting();
     } else if (current_tab == CALIBRATION_TAB_INDEX) {
       activate_selected_calibration_setting();
+    } else if (current_tab == LIFT_TAB_INDEX) {
+      if (!lift_config::motion_allowed || lift.enabled || lift.release_unconfirmed) lift.release();
+      else lift.enable(now);
+      log_lift_readback("button");
+      last_ud_nav_ms = now;
     }
     last_button_ms = now;
   }
@@ -1529,15 +1719,28 @@ static void handle_joystick_navigation() {
 // -----------------------------
 // Arduino
 // -----------------------------
+static void show_boot_stage(const char* stage) {
+  Serial.printf("Boot: %s\n", stage);
+  M5.Display.fillScreen(0x0000);
+  M5.Display.setTextColor(0xFFFF, 0x0000);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(12, 24);
+  M5.Display.println("NCIR Reset");
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(12, 64);
+  M5.Display.println(stage);
+}
+
 void setup() {
+  Serial.begin(115200);
+  Serial.println("Boot: initializing CoreS3");
   auto cfg = M5.config();
+  // Establish visible diagnostics before applying power to attached units.
   cfg.output_power = true;
   M5.begin(cfg);
-  M5.Power.setBatteryCharge(true);
-  M5.Power.setChargeCurrent(BATTERY_CHARGE_CURRENT_MA);
-  M5.Power.setChargeVoltage(BATTERY_CHARGE_VOLTAGE_MV);
-  M5.Power.setExtOutput(true);
   M5.Speaker.setVolume(64);
+  M5.Power.setExtOutput(true);
+  delay(100);
 
   Serial.begin(115200);
   Serial.println("M5Stack CoreS3 started");
@@ -1551,16 +1754,32 @@ void setup() {
       M5.Power.getVBUSVoltage(),
       M5.Power.Axp2101.getBatState() ? "yes" : "no");
 
+  show_boot_stage("Checking external I2C / lift");
   Wire.begin(PORTA_SDA, PORTA_SCL, I2C_FREQ);
+  Wire.setTimeOut(50);
+  // An absent optional unit must not prevent normal battery idle sleep.
+  if (pahub_select(lift_config::hub_channel)) {
+    Wire.beginTransmission(lift_config::address);
+    if (Wire.endTransmission() == 0) lift.release();
+    else lift.fault = true;
+  } else {
+    lift.fault = true;
+  }
+  show_boot_stage("Loading settings");
   load_preferences();
   log_debug_settings_summary();
+
+  show_boot_stage("Creating interface");
+  init_lvgl();
+  build_ui();
+  update_ui();
+  lv_refr_now(g_display); // Show the interface before network/sensor initialization.
+  Serial.println("Boot: interface rendered");
 
   connect_wifi(WIFI_CONNECT_TIMEOUT_MS);
   last_wifi_status_ms = millis();
 
-  init_lvgl();
-  build_ui();
-
+  Serial.println("Boot: initializing NCIR");
   sensor_ok = init_mlx();
   if (!sensor_ok) {
     temp_valid = false;
@@ -1581,10 +1800,12 @@ void setup() {
 
   update_ui();
   note_user_activity();
+  Serial.println("Boot: ready");
 }
 
 void loop() {
   M5.update();
+  update_alert_jingle();
   if (touch_has_activity()) {
     note_user_activity();
   }
@@ -1597,7 +1818,7 @@ void loop() {
   }
 
   battery_level_pct = M5.Power.getBatteryLevel();
-  battery_charging = M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
+  battery_charging = M5.Power.isCharging();
 
   if (now - last_lv_tick >= LV_TICK_MS) {
     lv_tick_inc(now - last_lv_tick);
@@ -1607,6 +1828,15 @@ void loop() {
   if (now - last_joy_update >= JOY_UPDATE_MS) {
     handle_joystick_navigation();
     last_joy_update = now;
+  }
+  if (!restart_pending) {
+    const bool was_enabled = lift.enabled;
+    const int prior_angle = lift.commanded_deg;
+    lift.tick(millis());
+    if (lift.enabled != was_enabled ||
+        ((debug_enabled || lift_config::bench_test) && lift.commanded_deg != prior_angle)) {
+      log_lift_readback("step");
+    }
   }
 
   if (sensor_ok && (now - last_temp_update >= (uint32_t)refresh_options_ms[refresh_index])) {
@@ -1622,7 +1852,7 @@ void loop() {
     }
   }
 
-  handle_temperature_alert(now);
+  handle_temperature_alert();
 
   if (now - last_wifi_status_ms >= WIFI_STATUS_UPDATE_MS) {
     update_wifi_status();

@@ -30,11 +30,12 @@ Built with **PlatformIO**, **Arduino**, **M5Unified**, and **LVGL 9**.
 
 ## Overview
 
-The device continuously measures **object temperature** (what the MLX90614 is pointed at). Readings are shown on a five-tab UI, color-coded by operating zone, and optionally compared against an alert threshold.
+The device continuously measures **object temperature** (what the MLX90614 is pointed at). Readings are shown on a six-tab UI, color-coded by operating zone, and optionally compared against an alert threshold.
 
 | Capability | Description |
 |------------|-------------|
 | Live display | Large temperature, bar graph, zone label, fan/WiFi/emissivity status |
+| NCIR lift | MEUS ME-X8 V1 through U165; direct height targets, enable/center/release |
 | Statistics | Session min, max, last reading, read count |
 | Settings | Units, refresh rate, emissivity, debug, power off |
 | Alerts | Enable/disable and threshold with sound + green screen highlight |
@@ -47,6 +48,10 @@ Ambient temperature is still read for the sensor but is **not** shown on the Liv
 
 ---
 
+## NCIR lift
+
+The Lift tab uses nonlinear inverse kinematics for the 50 mm vertical mechanism in the supplied corrected CAD model. See [wiring, controls and bench setup](docs/NCIR_LIFT.md). Defaults: Pa.Hub port 0, U165 output 0. Enabling commands center immediately; normal targets are sent directly at a minimum 20 ms interval and held until release. Motion starts only after a press. Target and command displays are not measured position; support the carriage before release.
+
 ## Hardware
 
 | Component | Role |
@@ -54,17 +59,19 @@ Ambient temperature is still read for the sensor but is **not** shown on the Liv
 | **M5Stack CoreS3** | ESP32-S3, 320×240 display, touch, battery, speaker |
 | **Pa.HUB** (I2C `0x70`) | Multiplexer on **Port A** |
 | **Joystick2** (I2C `0x63`, hub **channel 1**) | Navigation and actions |
+| **Unit 8Servos U165** (I2C `0x25`, hub **channel 0**) | Optional ME-X8 lift controller, output 0 |
 | **MLX90614** (I2C `0x5A`, hub **channel 5**) | Non-contact IR temperature |
 
 **Port A I2C:** SDA = GPIO **2**, SCL = GPIO **1**, 100 kHz.
 
-External **5V bus power** for Port A is enabled at boot (`M5.Power.setExtOutput(true)`).
+Boot requests external Port A power after display initialization (`M5.Power.setExtOutput(true)`). This request is not evidence of connector voltage; earlier serial captures reported BUS_EN OFF. Use the U165 documented motor supply and verify power under load.
 
 Battery charging is explicitly enabled at **4.20 V / 500 mA**. The UI appends `+` to the battery percentage only while M5Unified reports an active charging state.
 
 ```
 CoreS3 (Port A)
     └── Pa.HUB (0x70)
+            ├── Ch 0 → Unit 8Servos (0x25), output 0 → ME-X8
             ├── Ch 1 → Joystick2 (0x63)
             └── Ch 5 → MLX90614 (0x5A)
 ```
@@ -81,8 +88,11 @@ Ncir Reset/
 ├── include/
 │   ├── secrets.h.example   # Copy to secrets.h (gitignored)
 │   ├── secrets.h           # Your WiFi + webhook (not in repo)
+│   ├── lift_control.h      # Hardware-independent lift controller
 │   ├── lv_conf.h           # LVGL configuration
 │   └── lvgl_m5gfx_compat.h # Display compatibility shim
+├── docs/                  # Lift, flash checklist, roadmap
+├── test/lift_control_test.cpp # Host controller regression checks
 └── README.md               # This file
 ```
 
@@ -109,6 +119,7 @@ Edit `include/secrets.h`:
 | `WIFI_SSID` | WiFi network name |
 | `WIFI_PASS` | WiFi password |
 | `FAN_WEBHOOK_URL` | URL for fan toggle (HTTP POST, empty JSON body `{}`) |
+| `SMOKE_FAN_WEBHOOK_URL` | URL for Smoke Fan smart-plug toggle (HTTP POST, empty JSON body `{}`) |
 
 ### Build and upload
 
@@ -127,7 +138,7 @@ pio device monitor -e m5stack-cores3
 
 ## Configuration
 
-All user-facing options are available on-device except WiFi and webhook URL (compile-time in `secrets.h`).
+All user-facing options are available on-device except WiFi and webhook URLs (compile-time in `secrets.h`).
 
 Changing **emissivity** in Settings writes the MLX90614 register and **restarts** the ESP32 after ~2.5 s so the sensor stack re-initializes cleanly.
 
@@ -135,7 +146,7 @@ Changing **emissivity** in Settings writes the MLX90614 register and **restarts*
 
 ## User interface guide
 
-Five tabs at the top of the screen. **Battery** (`92%+`) is shown in the top-right on every tab.
+Six tabs at the top of the screen. **Battery** (`92%+`) is shown in the top-right on every tab.
 
 ### Live
 
@@ -146,14 +157,16 @@ Five tabs at the top of the screen. **Battery** (`92%+`) is shown in the top-rig
 | Bar | Level vs range (0–800 °F or 0–450 °C); fill color = zone |
 | **COLD / GOOD / TOO HOT** | Zone label |
 | **Fan** | Last known fan state after webhook (`ON` / `off` / `--`) |
+| **Smoke Fan** | Last known smart-plug state after its webhook (`ON` / `off` / `--`) |
 | **WiFi** | `OK` or `--` |
 | **e 0.95** | Current emissivity |
-| Yellow notice | Fan webhook status; `Sending...` remains visible until the request finishes |
-| Hint | `Press: toggle fan` |
+| Cyan outline | Currently selected webhook control |
+| Yellow notice | Webhook status; the sending message remains visible until the request finishes |
+| Hint | `Up/Down: select   Press: toggle` |
 
 Card border turns **green** when an alert is active.
 
-The webhook runs in a FreeRTOS worker task so WiFi reconnect and HTTP timeouts do not freeze the LVGL loop. A second press is ignored while a request is active. An HTTP **2xx** response toggles the locally remembered fan state; this is not a query of the fan's physical state.
+Webhooks run in a FreeRTOS worker task so WiFi reconnect and HTTP timeouts do not freeze the LVGL loop. A second press is ignored while a request is active. An HTTP **2xx** response toggles the selected control's locally remembered state; this is not a query of either device's physical state.
 
 ### Stats
 
@@ -181,7 +194,7 @@ The webhook runs in a FreeRTOS worker task so WiFi reconnect and HTTP timeouts d
 | Alerts | Toggle ON / OFF |
 | Threshold | Edit mode → Up/Down → Press to save |
 
-When enabled and object temp ≥ threshold: two-tone “target reached” sound, then repeating alert tones (1.5 s cooldown), green Live background until temp drops **5 °F** below threshold (hysteresis).
+When enabled and object temperature reaches the threshold, a four-note ascending jingle plays once per threshold crossing and the Live highlight turns green. Dropping below the threshold clears the highlight and rearms the alert; there is no 5 °F hysteresis or repeating cooldown tone.
 
 ### Cal
 
@@ -204,11 +217,12 @@ Joystick is read over I2C (center ≈ **128**). Values are low-pass filtered.
 
 | Tab | Up / Down | Press |
 |-----|-----------|-------|
-| **Live** | — | Toggle fan (webhook) |
+| **Live** | Select Fan / Smoke Fan | Toggle selected webhook |
 | **Settings** | Move selection / adjust emissivity in edit mode | Change or apply |
 | **Alerts** | Move selection / adjust threshold in edit mode | Change or apply |
 | **Cal** | Move selection / adjust offset in edit mode | Save offset |
 | **Stats** | — | — |
+| **Lift** | 1 mm light / 5 mm full deflection; repeat ≥35 ms | Enable at 25 mm / release PWM |
 
 Repeat rate for held direction: **220 ms**.
 
@@ -232,6 +246,7 @@ Zones use **object temperature in °F** internally (even when displaying °C).
 
 - Timer resets on: meaningful joystick movement/button input, tab changes, touch, or a **1 °F** object-temperature change from the activity baseline.
 - While USB VBUS is at least **4.0 V**, idle sleep is disabled.
+- Sleep is inhibited while the lift is enabled or PWM release is unconfirmed.
 - After **120 s** idle on battery (and not in an edit mode): display sleep, WiFi disconnect.
 - Wake: joystick movement/button, screen touch, or connecting USB power → display on, WiFi reconnect.
 - **3 s** cooldown after wake before sleep can trigger again.
@@ -275,7 +290,7 @@ Stored in ESP32 **Preferences** namespace `uiflow`:
 | `JOY_BUTTON_DEBOUNCE_MS` | 220 | Button debounce |
 | `IDLE_SLEEP_TIMEOUT_MS` | 120000 | Idle before sleep |
 | `WIFI_CONNECT_TIMEOUT_MS` | 10000 | Initial WiFi connect |
-| `HTTP_TIMEOUT_MS` | 5000 | Fan webhook timeout |
+| `HTTP_TIMEOUT_MS` | 5000 | Webhook timeout |
 | `TEMP_ACTIVITY_DELTA_F` | 1.0 | Temperature change counted as activity |
 | `USB_POWER_PRESENT_MV` | 4000 | VBUS threshold that prevents/wakes sleep |
 | `RESTART_DELAY_MS` | 2500 | Delay before reboot after emissivity save |
@@ -305,6 +320,7 @@ Stored in ESP32 **Preferences** namespace `uiflow`:
 | 2 | Settings |
 | 3 | Alerts |
 | 4 | Cal |
+| 5 | Lift |
 
 ---
 
@@ -315,6 +331,7 @@ Stored in ESP32 **Preferences** namespace `uiflow`:
 | Pa.HUB | `0x70` | — | Channel select: `1 << ch` |
 | Joystick2 | `0x63` | 1 | Reg `0x10` X, `0x11` Y, `0x20` button (0 = pressed) |
 | MLX90614 | `0x5A` | 5 | Adafruit library |
+| Unit 8Servos | `0x25` | 0 | Output 0; mode and 16-bit pulse registers |
 
 ---
 
@@ -349,8 +366,8 @@ Enable **Debug: ON** in Settings. At 115200 baud you will see:
 |---------|-----------------|
 | MLX init failed | Hub channel 5, wiring, sensor address `0x5A`, Port A power |
 | WiFi `--` | `secrets.h`, signal, 10 s connect timeout; reconnect every 5 s cooldown |
-| Fan webhook fails | URL in `secrets.h`, HTTP 2xx expected, serial debug for code |
-| Fan display disagrees with reality | Current firmware remembers successful toggles; it does not query the physical fan state |
+| A webhook fails | Corresponding URL in `secrets.h`, HTTP 2xx expected, serial debug for code |
+| A displayed device state disagrees with reality | Current firmware remembers successful toggles; it does not query physical state |
 | Sleep right after use | Ensure latest firmware (idle timer underflow fix) |
 | Emissivity change needs reboot | By design; wait for automatic restart |
 | UI clipped / overlapping | Live tab uses fixed layout; rebuild after UI changes |
@@ -362,13 +379,13 @@ For a complete post-flash procedure, see [docs/FLASH_AND_SMOKE_TEST.md](docs/FLA
 
 ## Release status
 
-The current release build was successfully written to a CoreS3 on **COM3** with esptool verification and a hard reset. The release build uses **43.2% RAM** (141,684 / 327,680 bytes) and **21.7% flash** (1,419,669 / 6,553,600 bytes).
+Documentation reviewed against the current source on **2026-10-02**. See [the flash checklist](docs/FLASH_AND_SMOKE_TEST.md) for current build evidence and post-flash checks. Earlier COM3 uploads and boot captures are recorded in [the lift guide](docs/NCIR_LIFT.md); they do not prove that this checkout is currently installed or that loaded movement is verified.
 
 Verified by build or source inspection:
 
 - M5Unified charging APIs compile for the CoreS3 AXP2101 at 4.20 V / 500 mA.
 - USB VBUS gates idle sleep and is checked during battery sleep polling.
-- Fan HTTP work runs outside the main UI loop with atomic duplicate-request protection.
+- Fan and Smoke Fan HTTP work runs outside the main UI loop with atomic duplicate-request protection.
 - Unused LVGL logging, Lottie, QR, vector/ThorVG, examples, and demos are disabled.
 - `include/secrets.h` remains ignored and was not committed.
 
@@ -376,7 +393,7 @@ Still requiring physical observation after a flash:
 
 - Actual battery charge current and full-charge termination.
 - USB plug/unplug behavior across a full two-minute idle cycle.
-- Real fan response and agreement between the displayed state and the physical fan.
+- Real fan/smart-plug response and agreement between displayed and physical state.
 - Sensor, joystick, alert sound, and touch behavior in the final enclosure.
 
 ---

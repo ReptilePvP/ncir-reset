@@ -6,3 +6,5 @@
 .DS_Store
 Thumbs.db
 include/secrets.h
+.chair-cad-venv/
+cad/chair_arm_repair/**/__pycache__/
