@@ -31,11 +31,13 @@ int main() {
   assert(LiftControl::angleForHeight(-100) == 30);
   assert(LiftControl::angleForHeight(25) == 90);
   assert(LiftControl::angleForHeight(100) == 150);
-  assert(LiftControl::pulseForAngle(0) == 500);
+  for (int angle = -180; angle <= 30; ++angle)
+    assert(LiftControl::pulseForAngle(angle) == 833); // Hard mechanical lower stop.
   assert(LiftControl::pulseForAngle(30) == 833);
   assert(LiftControl::pulseForAngle(90) == 1500);
   assert(LiftControl::pulseForAngle(150) == 2167);
   assert(LiftControl::pulseForAngle(180) == 2500);
+  assert(LiftControl::pulseForAngle(500) == 2500);
   for (int mm = 0; mm <= 50; ++mm) {
     int angle = LiftControl::angleForHeight(mm);
     double height = 25 + 25 / sin(3.141592653589793 / 3) *

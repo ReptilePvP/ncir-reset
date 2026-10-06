@@ -1,6 +1,6 @@
 # NCIR vertical lift - MEUS ME-X8 servo
 
-## Current mode: full manual lift (reviewed 2026-10-02)
+## Current mode: full manual lift (reviewed 2026-10-06)
 
 Full manual control is enabled (`motion_allowed = true`, `bench_test = false`).
 Use the MEUS ME-X8 V1 positional servo identified by the supplied Amazon ASIN B0CB8N6KLC. Press in Lift to enable at center (25 mm),
@@ -39,6 +39,11 @@ travel specification. Check the actual label/version if it differs from the link
 
 The firmware now sends explicit 16-bit little-endian pulse commands to the U165
 register `0x60 + 2 * channel`, and diagnostics read back that pulse register.
+All angle-to-pulse commands are clamped to a hard minimum of 30 degrees (833 us)
+to avoid driving below the lift's mechanical lower stop, including commands
+outside the normal height mapping. The upper angle clamp is 180 degrees (2500 us);
+normal height targets remain within 30-150 degrees. These are software command
+limits; actual stop clearance must be checked on the assembled mechanism.
 Center is 1500 us. Nominal 0/25/50 mm lift commands are 833/1500/2167 us, staying
 inside the advertised full pulse range. The pulse-to-angle relationship is a
 nominal mapping: actual travel, center, horn indexing and CAD fit still require
@@ -48,7 +53,7 @@ An external supply through U165 does not imply an 8.4 V servo output: this unit
 provides a 5 V motor rail. Do not put 8.4 V on its 5 V terminal. Use its labeled
 power inputs and manufacturer wiring. The code cannot remedy inadequate supply
 current, voltage dips, mechanical binding or hardware damage. The first-enable
-center step can still draw startup current despite slow later motion.
+center step can still draw startup current; normal later targets are also direct commands.
 
 ## Previous brief unloaded servo test
 
@@ -130,7 +135,7 @@ linked tilt design in `common.py` is not the exported assembly's motion.
   sustain motor stall current.
 
 `include/lift_control.h` contains the hub/output channels, address, center angle,
-direction, permitted height limits and motion interval. The defaults assume the
+direction, permitted height and angle limits, and motion interval. The defaults assume the
 stock horn is indexed horizontally at a 90-degree servo command. Increasing
 servo angle is assumed to raise the lift; set `direction = -1` if needed.
 The unused seven outputs are not configured by this firmware.
@@ -144,6 +149,9 @@ This is not the 8Servos HAT protocol. See the
 ## Controls
 
 Navigate right past Cal to the **Lift** tab using Joystick2.
+Hold Joystick2 with its connector on the right and stick on the left. Navigation
+uses `x = 128 - rawY` and `y = rawX - 128` before low-pass filtering; positive
+filtered Y raises the height target.
 
 - **Press:** enable at the middle position (25 mm / default 90 degrees).
 - **Up / Down:** light deflection adjusts by 1 mm; full deflection adjusts by 5 mm. Holding repeats at a 35 ms minimum interval, subject to loop timing.
@@ -198,7 +206,7 @@ the current physical position is unknown; this first movement is not slew-limite
 Build firmware with `platformio run`. Host regression tests are in
 `test/lift_control_test.cpp`; compile with a C++17 compiler and `-Iinclude`, then
 run the resulting executable. They exercise the actual controller with a fake
-I2C writer: CAD mapping, clamping, direct-command timing and optional bench slew, all enable-write failures, release,
+I2C writer: CAD mapping, height and 30-180 degree pulse clamping, direct-command timing and optional bench slew, all enable-write failures, release,
 disconnection, no automatic reconnect motion, and millis rollover.
 
 These tests do not establish electrical communication, real servo direction,

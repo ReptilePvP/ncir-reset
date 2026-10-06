@@ -1590,8 +1590,9 @@ static void handle_joystick_navigation() {
 
   if (!read_joystick2_raw(rawX, rawY, pressed)) return;
 
-  int x = (int)rawX - JOY_CENTER;
-  int y = JOY_CENTER - (int)rawY;  // invert so up is positive-ish
+  // Connector on the right, stick on the left: swap the navigation axes.
+  int x = JOY_CENTER - (int)rawY;
+  int y = (int)rawX - JOY_CENTER;
   if (joystick_has_activity(x, y, pressed)) {
     note_user_activity();
   }

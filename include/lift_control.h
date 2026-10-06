@@ -15,6 +15,8 @@ constexpr uint8_t address = 0x25;
 constexpr uint8_t servo_channel = 0;
 // Index the horn at horizontal with a 90-degree command before assembly.
 constexpr int center_deg = 90;
+constexpr int min_angle_deg = 30; // Mechanical lower stop: never command below this.
+constexpr int max_angle_deg = 180;
 constexpr int direction = 1; // Set -1 if increasing angles lowers the carriage.
 constexpr int min_height_mm = 0;
 constexpr int max_height_mm = 50; // Reduce these limits for initial fit testing.
@@ -28,6 +30,8 @@ inline int joystickStepMm(int deflection) {
 static_assert(hub_channel < 6 && servo_channel < 8, "Invalid lift channel");
 static_assert(direction == 1 || direction == -1, "Invalid lift direction");
 static_assert(center_deg >= 60 && center_deg <= 120, "Servo travel out of range");
+static_assert(min_angle_deg >= 30 && min_angle_deg <= center_deg &&
+              max_angle_deg >= center_deg && max_angle_deg <= 180, "Invalid servo angle limits");
 static_assert(min_height_mm >= 0 && min_height_mm <= 25 &&
               max_height_mm >= 25 && max_height_mm <= 50, "Invalid lift limits");
 }
@@ -49,10 +53,11 @@ class LiftControl {
     mm = limit(mm, lift_config::min_height_mm, lift_config::max_height_mm);
     const double crank = asin((mm - 25.0) * sin(3.141592653589793 / 3.0) / 25.0)
                          * 180.0 / 3.141592653589793;
-    return lift_config::center_deg + lift_config::direction * (int)lround(crank);
+    return limit(lift_config::center_deg + lift_config::direction * (int)lround(crank),
+                 lift_config::min_angle_deg, lift_config::max_angle_deg);
   }
   static uint16_t pulseForAngle(int angle) {
-    angle = limit(angle, 0, 180);
+    angle = limit(angle, lift_config::min_angle_deg, lift_config::max_angle_deg);
     return lift_config::pulse_min_us +
         (angle * (lift_config::pulse_max_us - lift_config::pulse_min_us) + 90) / 180;
   }

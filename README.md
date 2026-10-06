@@ -52,6 +52,8 @@ Ambient temperature is still read for the sensor but is **not** shown on the Liv
 
 The Lift tab uses nonlinear inverse kinematics for the 50 mm vertical mechanism in the supplied corrected CAD model. See [wiring, controls and bench setup](docs/NCIR_LIFT.md). Defaults: Pa.Hub port 0, U165 output 0. Enabling commands center immediately; normal targets are sent directly at a minimum 20 ms interval and held until release. Motion starts only after a press. Target and command displays are not measured position; support the carriage before release.
 
+Angle conversion is clamped to 30-180 degrees (833-2500 us); normal 0-50 mm height targets use 30-150 degrees. This command floor does not establish physical clearance or stop position.
+
 ## Hardware
 
 | Component | Role |
@@ -208,6 +210,8 @@ Offset is added to both object and ambient raw readings before display.
 
 ## Joystick controls
 
+Hold the joystick with its connector on the right and the stick on the left. Navigation axes are mapped for this orientation.
+
 Joystick is read over I2C (center ≈ **128**). Values are low-pass filtered.
 
 | Input | Action (global) |
@@ -224,7 +228,7 @@ Joystick is read over I2C (center ≈ **128**). Values are low-pass filtered.
 | **Stats** | — | — |
 | **Lift** | 1 mm light / 5 mm full deflection; repeat ≥35 ms | Enable at 25 mm / release PWM |
 
-Repeat rate for held direction: **220 ms**.
+Repeat rate for held direction: **220 ms** for tabs and menus; Lift height adjustment uses a **35 ms minimum** interval, subject to loop timing.
 
 ---
 
@@ -379,7 +383,7 @@ For a complete post-flash procedure, see [docs/FLASH_AND_SMOKE_TEST.md](docs/FLA
 
 ## Release status
 
-Documentation reviewed against the current source on **2026-10-02**. See [the flash checklist](docs/FLASH_AND_SMOKE_TEST.md) for current build evidence and post-flash checks. Earlier COM3 uploads and boot captures are recorded in [the lift guide](docs/NCIR_LIFT.md); they do not prove that this checkout is currently installed or that loaded movement is verified.
+Documentation reviewed against the current source on **2026-10-06**. See [the flash checklist](docs/FLASH_AND_SMOKE_TEST.md) for current build evidence and post-flash checks. Earlier COM3 uploads and boot captures are recorded in [the lift guide](docs/NCIR_LIFT.md); they do not prove that this checkout is currently installed or that loaded movement is verified.
 
 Verified by build or source inspection:
 

@@ -1,11 +1,20 @@
+# Lift controller host regression
 
-This directory is intended for PlatformIO Test Runner and project tests.
+`lift_control_test.cpp` tests the actual `include/lift_control.h` with a fake
+I2C writer. It covers inverse kinematics, 0-50 mm limits, the 30-degree pulse
+floor and 180-degree ceiling, direct targets, 20 ms scheduling, 1/5 mm joystick
+step selection, holding, release failures, reconnect, lockout, optional bench
+sweep/deadline, and millis rollover.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+From the project root, with a configured host C++17 compiler:
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+```sh
+g++ -std=c++17 -Iinclude test/lift_control_test.cpp -o .pio/lift_control_test
+.pio/lift_control_test
+```
+
+Create `.pio` first if no firmware build has run. On Windows, use an `.exe`
+output name. Keep assertions enabled: do not compile with `-DNDEBUG`.
+This is a standalone executable, not a configured PlatformIO native test suite.
+It does not test the application joystick axis transform or physical hardware.
+See `../docs/FLASH_AND_SMOKE_TEST.md` for current evidence and device checks.

@@ -2,15 +2,17 @@
 
 This roadmap prioritizes changes by expected user-visible value. Measure before and after each optimization; the release has substantial flash headroom, so responsiveness, I2C efficiency, and reliability matter more than binary size.
 
-## Current implementation (2026-10-02)
+## Current implementation (2026-10-06)
 
 Six tabs include the optional ME-X8 lift. Normal lift targets use direct pulse commands every 20 ms at most; joystick repeat is at least 35 ms with 1/5 mm steps. Optional bench mode alone retains slow stepping. Host controller tests already cover mapping, limits, holding, faults, lockout and rollover. Loaded travel, power stability and actual speed remain to be measured.
 
+Joystick navigation is mapped for connector-right/stick-left orientation. Angle-to-pulse conversion clamps every command to 30-180 degrees (833-2500 us), while normal lift targets use 30-150 degrees. Alerts use a four-note ascending jingle once per threshold crossing and rearm immediately below the threshold.
+
 ## Performance priorities
 
-### P1 â€” Poll slow-changing power data less often
+### P1 - Poll slow-changing power data less often
 
-`getBatteryLevel()` and `isCharging()` currently run on every main-loop pass. Both can involve PMIC I2C work even though the UI only needs battery data every 1â€“5 seconds.
+`getBatteryLevel()` and `isCharging()` currently run on every main-loop pass. Both can involve PMIC I2C work even though the UI only needs battery data every 1-5 seconds.
 
 Recommended change:
 
@@ -20,7 +22,7 @@ Recommended change:
 
 Expected result: less internal I2C contention and more deterministic LVGL/sensor timing.
 
-### P1 â€” Match sampling to useful sensor throughput
+### P1 - Match sampling to useful sensor throughput
 
 The selectable 35/60/100/150 ms intervals can request data faster than the MLX90614 is producing meaningful new measurements, depending on its configured refresh rate.
 
@@ -33,7 +35,7 @@ Recommended change:
 
 Expected result: lower bus load, steadier readings, and fewer false activity/alert transitions.
 
-### P1 â€” Replace blocking WiFi reconnect with a state machine
+### P1 - Replace blocking WiFi reconnect with a state machine
 
 The webhook is already off the UI task, but boot and wake reconnection can still wait several seconds.
 
@@ -45,13 +47,13 @@ Recommended change:
 
 Expected result: instant screen availability after boot/wake and clearer network status.
 
-### P2 â€” Use a FreeRTOS queue for webhook results
+### P2 - Use a FreeRTOS queue for webhook results
 
 The worker task currently publishes small shared state directly. Move completion code, HTTP status, and notice text through a one-element queue consumed by the main task.
 
 Expected result: single-threaded UI/state mutation and simpler concurrency reasoning.
 
-### P2 â€” Profile the main loop
+### P2 - Profile the main loop
 
 Add optional counters for:
 
@@ -63,7 +65,7 @@ Add optional counters for:
 
 Display these on a hidden diagnostics page or print them once every 10 seconds when debug mode is enabled.
 
-### P3 â€” Trim LVGL configuration further only if needed
+### P3 - Trim LVGL configuration further only if needed
 
 Logging, demos, examples, Lottie, QR, and vector/ThorVG are already disabled. Additional unused widgets, decoders, filesystems, themes, and fonts can be disabled later, but flash is not currently constrained.
 
@@ -78,14 +80,14 @@ Prioritize a guarded lift bench trial: confirm supply stability, horn/cradle fit
 4. **Watchdog and fault recovery:** count consecutive sensor/hub failures, reinitialize the affected bus/channel, and show a clear fault instead of silently retaining stale data.
 5. **Battery protection validation:** measure charge current and battery temperature on the actual CoreS3/DIN base before treating 500 mA as hardware-validated.
 6. **USB serial diagnostics:** enable the appropriate ESP32-S3 USB CDC build flags if reliable boot logs over the programming cable are desired.
-7. **Automated checks:** add host-testable functions for thresholds, unit conversion, hysteresis, preference validation, and sleep decisions; add a compile workflow for pull requests.
+7. **Automated checks:** add host-testable functions for threshold crossings, unit conversion, preference validation, and sleep decisions; add a compile workflow for pull requests. Current alerts have no hysteresis; test hysteresis only if it is introduced.
 
 ## Recommended new features
 
 ### Highest value
 
 - **Peak hold and session timer:** show peak temperature, time at/above target, and cooldown duration.
-- **Temperature history graph:** a compact rolling 30â€“120 second chart with target and alert lines.
+- **Temperature history graph:** a compact rolling 30-120 second chart with target and alert lines.
 - **Emissivity presets:** common materials plus a custom value, with a warning that reflective metal needs special handling.
 - **Fan automation mode:** Off / Manual / Auto with separate on/off thresholds and hysteresis.
 - **Connection diagnostics:** WiFi RSSI, last HTTP code, last successful fan command, request latency, and retry action.
