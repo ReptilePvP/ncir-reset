@@ -14,6 +14,12 @@
 #include <lvgl.h>
 #include <Adafruit_MLX90614.h>
 #include "lift_control.h"
+#include "ncir_ui_theme.h"
+#include "ncir_lottie_assets.h"
+
+// ThorVG's Lottie parser/renderer runs on the Arduino task. Its nested calls
+// overflow the framework's 8 KiB default stack on ESP32-S3.
+SET_LOOP_TASK_STACK_SIZE(32 * 1024);
 
 // -----------------------------
 // CoreS3 / Port A I2C
@@ -83,6 +89,13 @@ static lv_obj_t* tabview = nullptr;
 
 // Live tab
 static lv_obj_t* live_hero_panel = nullptr;
+static lv_obj_t* live_lottie = nullptr;
+static int live_lottie_zone = -1;
+static lv_obj_t* fan_lottie = nullptr;
+static lv_obj_t* smoke_fan_lottie = nullptr;
+alignas(4) static uint8_t fan_lottie_buffer[28 * 28 * 4];
+alignas(4) static uint8_t smoke_fan_lottie_buffer[28 * 28 * 4];
+alignas(4) static uint8_t live_lottie_buffer[48 * 48 * 4];
 static lv_obj_t* lbl_live_temp = nullptr;
 static lv_obj_t* bar_live_temp = nullptr;
 static lv_obj_t* lbl_live_zone = nullptr;
@@ -206,7 +219,7 @@ enum LiveRow {
 };
 
 static int selected_settings_row = SETTINGS_ROW_UNITS;
-static int selected_live_row = LIVE_ROW_FAN;
+static int selected_live_row = -1;  // -1 selects navigation, with neither fan highlighted.
 static float current_emissivity = 0.95f;
 static float pending_emissivity = 0.95f;
 static bool emissivity_edit_mode = false;
@@ -843,9 +856,9 @@ static bool write_emissivity_value(float emissivity) {
 }
 
 static lv_color_t zone_color_from_temp_f(float temp_f) {
-  if (temp_f < 500.0f) return lv_color_hex(0x60A5FA);
-  if (temp_f <= 610.0f) return lv_color_hex(0x4ADE80);
-  return lv_color_hex(0xF87171);
+  if (temp_f < 500.0f) return lv_color_hex(ncir_ui::cyan);
+  if (temp_f <= 610.0f) return lv_color_hex(ncir_ui::green);
+  return lv_color_hex(ncir_ui::red);
 }
 
 static const char* zone_text_from_temp_f(float temp_f) {
@@ -885,9 +898,60 @@ static void init_lvgl() {
 // -----------------------------
 // UI
 // -----------------------------
+// Change JSON only on a zone crossing, rather than reparsing every UI refresh.
+static void update_temperature_animation() {
+  if (live_lottie == nullptr) return;
+  lv_anim_t* animation = lv_lottie_get_anim(live_lottie);
+  const bool visible = current_tab == LIVE_TAB_INDEX && temp_valid && sensor_ok;
+  if (!visible) {
+    lv_anim_pause(animation);
+    lv_obj_add_flag(live_lottie, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  const int zone = object_temp_f < 500.0f ? 0 : object_temp_f <= 610.0f ? 1 : 2;
+  if (zone != live_lottie_zone) {
+    const char* sources[] = {ncir_lottie_assets::cold, ncir_lottie_assets::good, ncir_lottie_assets::hot};
+    lv_lottie_set_src_data(live_lottie, sources[zone], strlen(sources[zone]));
+    // The native player assumes 60 fps. Each bundled asset has 120 frames.
+    lv_anim_set_duration(animation, 2000);
+    live_lottie_zone = zone;
+  }
+  lv_obj_remove_flag(live_lottie, LV_OBJ_FLAG_HIDDEN);
+  if (lv_anim_is_paused(animation)) lv_anim_resume(animation);
+}
+
+static lv_obj_t* create_fan_animation(lv_obj_t* parent, void* buffer,
+                                       const char* source, uint32_t duration_ms,
+                                       int32_t representative_frame) {
+  lv_obj_t* widget = lv_lottie_create(parent);
+  lv_lottie_set_buffer(widget, 28, 28, buffer);
+  lv_lottie_set_src_data(widget, source, strlen(source));
+  lv_obj_set_pos(widget, 4, 2);
+  lv_obj_remove_flag(widget, LV_OBJ_FLAG_CLICKABLE);
+  lv_anim_t* animation = lv_lottie_get_anim(widget);
+  lv_anim_set_duration(animation, duration_ms);
+  // Airflow starts with an empty frame; show a visible mid-loop pose when OFF.
+  animation->exec_cb(animation->var, representative_frame);
+  animation->act_time = duration_ms / 2;
+  lv_anim_pause(animation);
+  return widget;
+}
+
+static void update_fan_animation(lv_obj_t* widget, bool known, bool on) {
+  if (!widget) return;
+  lv_anim_t* animation = lv_lottie_get_anim(widget);
+  const bool playing = current_tab == LIVE_TAB_INDEX && known && on;
+  if (playing && lv_anim_is_paused(animation)) lv_anim_resume(animation);
+  else if (!playing && !lv_anim_is_paused(animation)) lv_anim_pause(animation);
+  lv_obj_set_style_opa(widget, known && on ? LV_OPA_COVER : LV_OPA_40, 0);
+}
+
 static void build_ui() {
+  lv_display_set_theme(g_display, lv_theme_default_init(
+      g_display, lv_color_hex(ncir_ui::cyan), lv_color_hex(ncir_ui::magenta),
+      true, &::lv_font_montserrat_14));
   lv_obj_t* scr = lv_screen_active();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0F172A), 0);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(ncir_ui::background), 0);
 
   tabview = lv_tabview_create(scr);
   // Reserve 18 pixels above the tabs for the battery status.
@@ -903,10 +967,14 @@ static void build_ui() {
   lv_obj_t* tab_alerts = lv_tabview_add_tab(tabview, "Alerts");
   lv_obj_t* tab_calibration = lv_tabview_add_tab(tabview, "Cal");
   lv_obj_t* tab_lift = lv_tabview_add_tab(tabview, "Lift");
+  ncir_ui::style_tabs(tabview);
+  for (lv_obj_t* page : {tab_live, tab_stats, tab_settings, tab_alerts, tab_calibration, tab_lift}) {
+    ncir_ui::style_page(page);
+  }
   lv_obj_set_style_pad_all(tab_lift, 8, 0);
-  lv_obj_set_style_bg_color(tab_lift, lv_color_hex(0x0F172A), 0);
+  lv_obj_set_style_bg_color(tab_lift, lv_color_hex(ncir_ui::background), 0);
   lv_obj_set_style_bg_opa(tab_lift, LV_OPA_COVER, 0);
-  lv_obj_set_style_text_color(tab_lift, lv_color_hex(0xE2E8F0), 0);
+  lv_obj_set_style_text_color(tab_lift, lv_color_hex(ncir_ui::text), 0);
   lv_obj_remove_flag(tab_lift, LV_OBJ_FLAG_SCROLLABLE);
   lbl_lift_status = lv_label_create(tab_lift);
   lv_obj_set_width(lbl_lift_status, 300);
@@ -924,7 +992,7 @@ static void build_ui() {
           : "Up/Down: light 1mm / full 5mm\nPress: center / release\nLeft/Right: tabs\nSupport carriage before release")
       : "Motion disabled for diagnosis\nPress: retry PWM release only\nLeft/Right: tabs\nVerify servo model and power");
 
-  lv_obj_set_style_bg_color(tab_live, lv_color_hex(0x0F172A), 0);
+  lv_obj_set_style_bg_color(tab_live, lv_color_hex(ncir_ui::background), 0);
   lv_obj_set_style_bg_opa(tab_live, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(tab_live, 0, 0);
   lv_obj_set_style_border_width(tab_live, 0, 0);
@@ -934,35 +1002,42 @@ static void build_ui() {
   live_hero_panel = lv_obj_create(tab_live);
   lv_obj_set_size(live_hero_panel, 304, 80);
   lv_obj_align(live_hero_panel, LV_ALIGN_TOP_MID, 0, 4);
-  lv_obj_set_style_bg_color(live_hero_panel, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_color(live_hero_panel, lv_color_hex(ncir_ui::panel), 0);
   lv_obj_set_style_bg_opa(live_hero_panel, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(live_hero_panel, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_border_color(live_hero_panel, lv_color_hex(ncir_ui::line), 0);
   lv_obj_set_style_border_width(live_hero_panel, 1, 0);
-  lv_obj_set_style_radius(live_hero_panel, 12, 0);
+  lv_obj_set_style_radius(live_hero_panel, 0, 0);
   lv_obj_set_style_pad_all(live_hero_panel, 0, 0);
   lv_obj_remove_flag(live_hero_panel, LV_OBJ_FLAG_SCROLLABLE);
 
+  live_lottie = lv_lottie_create(live_hero_panel);
+  lv_lottie_set_buffer(live_lottie, 48, 48, live_lottie_buffer);
+  lv_obj_set_pos(live_lottie, 8, 14);
+  lv_obj_remove_flag(live_lottie, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(live_lottie, LV_OBJ_FLAG_HIDDEN);
+  lv_anim_pause(lv_lottie_get_anim(live_lottie));
+
   lbl_live_temp = lv_label_create(live_hero_panel);
   lv_obj_set_style_text_font(lbl_live_temp, &::lv_font_montserrat_32, 0);
-  lv_obj_set_style_text_color(lbl_live_temp, lv_color_hex(0xE2E8F0), 0);
-  lv_obj_align(lbl_live_temp, LV_ALIGN_TOP_MID, 0, 2);
+  lv_obj_set_style_text_color(lbl_live_temp, lv_color_hex(ncir_ui::text), 0);
+  lv_obj_align(lbl_live_temp, LV_ALIGN_TOP_MID, 30, 2);
   lv_label_set_text(lbl_live_temp, "-- F");
 
   bar_live_temp = lv_bar_create(live_hero_panel);
-  lv_obj_set_size(bar_live_temp, 256, 10);
-  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_MID, 0, 42);
+  lv_obj_set_size(bar_live_temp, 224, 10);
+  lv_obj_align(bar_live_temp, LV_ALIGN_TOP_MID, 30, 42);
   lv_bar_set_range(bar_live_temp, 0, 800);
   lv_bar_set_value(bar_live_temp, 0, LV_ANIM_OFF);
   lv_obj_set_style_radius(bar_live_temp, 5, 0);
   lv_obj_set_style_radius(bar_live_temp, 5, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(bar_live_temp, lv_color_hex(0x0F172A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(bar_live_temp, lv_color_hex(ncir_ui::background), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(bar_live_temp, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_pad_all(bar_live_temp, 0, 0);
 
   lbl_live_zone = lv_label_create(live_hero_panel);
   lv_obj_set_style_text_font(lbl_live_zone, &::lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(lbl_live_zone, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(lbl_live_zone, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_set_style_text_color(lbl_live_zone, lv_color_hex(ncir_ui::muted), 0);
+  lv_obj_align(lbl_live_zone, LV_ALIGN_TOP_MID, 30, 56);
   lv_label_set_text(lbl_live_zone, "--");
 
   btn_live_fan = lv_button_create(tab_live);
@@ -970,14 +1045,18 @@ static void build_ui() {
   lv_obj_align(btn_live_fan, LV_ALIGN_TOP_LEFT, 8, 90);
   lv_obj_set_style_pad_all(btn_live_fan, 0, 0);
   lv_obj_set_style_shadow_width(btn_live_fan, 0, 0);
-  lv_obj_set_style_bg_color(btn_live_fan, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_color(btn_live_fan, lv_color_hex(ncir_ui::panel), 0);
   lv_obj_set_style_bg_opa(btn_live_fan, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(btn_live_fan, 8, 0);
+  lv_obj_set_style_radius(btn_live_fan, 0, 0);
   lv_obj_set_style_border_width(btn_live_fan, 2, 0);
   lbl_live_fan = lv_label_create(btn_live_fan);
   lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_fan, lv_color_hex(0x94A3B8), 0);
-  lv_obj_center(lbl_live_fan);
+  lv_obj_set_style_text_color(lbl_live_fan, lv_color_hex(ncir_ui::muted), 0);
+  lv_obj_set_style_text_font(lbl_live_fan, &::lv_font_montserrat_12, 0);
+  lv_obj_set_width(lbl_live_fan, 104);
+  lv_obj_set_pos(lbl_live_fan, 40, 9);
+  fan_lottie = create_fan_animation(btn_live_fan, fan_lottie_buffer,
+      ncir_lottie_assets::fan, 3000, 90);
   lv_label_set_text(lbl_live_fan, "Fan --");
 
   btn_live_smoke_fan = lv_button_create(tab_live);
@@ -985,32 +1064,36 @@ static void build_ui() {
   lv_obj_align(btn_live_smoke_fan, LV_ALIGN_TOP_RIGHT, -8, 90);
   lv_obj_set_style_pad_all(btn_live_smoke_fan, 0, 0);
   lv_obj_set_style_shadow_width(btn_live_smoke_fan, 0, 0);
-  lv_obj_set_style_bg_color(btn_live_smoke_fan, lv_color_hex(0x1E293B), 0);
+  lv_obj_set_style_bg_color(btn_live_smoke_fan, lv_color_hex(ncir_ui::panel), 0);
   lv_obj_set_style_bg_opa(btn_live_smoke_fan, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(btn_live_smoke_fan, 8, 0);
+  lv_obj_set_style_radius(btn_live_smoke_fan, 0, 0);
   lv_obj_set_style_border_width(btn_live_smoke_fan, 2, 0);
   lbl_live_smoke_fan = lv_label_create(btn_live_smoke_fan);
   lv_obj_set_style_text_font(lbl_live_smoke_fan, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_smoke_fan, lv_color_hex(0x94A3B8), 0);
-  lv_obj_center(lbl_live_smoke_fan);
+  lv_obj_set_style_text_color(lbl_live_smoke_fan, lv_color_hex(ncir_ui::muted), 0);
+  lv_obj_set_style_text_font(lbl_live_smoke_fan, &::lv_font_montserrat_12, 0);
+  lv_obj_set_width(lbl_live_smoke_fan, 104);
+  lv_obj_set_pos(lbl_live_smoke_fan, 40, 9);
+  smoke_fan_lottie = create_fan_animation(btn_live_smoke_fan, smoke_fan_lottie_buffer,
+      ncir_lottie_assets::smoke_fan, 750, 22);
   lv_label_set_text(lbl_live_smoke_fan, "Smoke Fan --");
 
   lbl_live_wifi = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_wifi, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_wifi, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_color(lbl_live_wifi, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_live_wifi, LV_ALIGN_TOP_RIGHT, -10, 150);
   lv_label_set_text(lbl_live_wifi, "WiFi --");
 
   lbl_live_emissivity = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_emissivity, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_emissivity, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_color(lbl_live_emissivity, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_live_emissivity, LV_ALIGN_TOP_LEFT, 10, 150);
   lv_label_set_text(lbl_live_emissivity, "e 0.95");
 
   lbl_live_fan_notice = lv_label_create(tab_live);
   lv_obj_set_size(lbl_live_fan_notice, 300, 18);
   lv_obj_set_style_text_font(lbl_live_fan_notice, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_live_fan_notice, lv_color_hex(0xFCD34D), 0);
+  lv_obj_set_style_text_color(lbl_live_fan_notice, lv_color_hex(ncir_ui::yellow), 0);
   lv_obj_set_style_text_align(lbl_live_fan_notice, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(lbl_live_fan_notice, LV_ALIGN_TOP_MID, 0, 128);
   lv_label_set_long_mode(lbl_live_fan_notice, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -1018,9 +1101,9 @@ static void build_ui() {
 
   lbl_live_hint = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_hint, &::lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(0x475569), 0);
+  lv_obj_set_style_text_color(lbl_live_hint, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_live_hint, LV_ALIGN_TOP_MID, 0, 172);
-  lv_label_set_text(lbl_live_hint, "Up/Down: select   Press: toggle");
+  lv_label_set_text(lbl_live_hint, "Down: fans   Left/Right: tabs");
 
   // Stats
   lbl_stats_min = lv_label_create(tab_stats);
@@ -1056,7 +1139,7 @@ static void build_ui() {
 
   lbl_settings_emissivity = lv_label_create(tab_settings);
   lv_obj_set_style_text_font(lbl_settings_emissivity, &::lv_font_montserrat_18, 0);
-  lv_obj_align(lbl_settings_emissivity, LV_ALIGN_TOP_LEFT, 8, 68);
+  lv_obj_align(lbl_settings_emissivity, LV_ALIGN_TOP_LEFT, 8, 60);
   lv_label_set_text(lbl_settings_emissivity, "Emissivity: 0.95");
 
   lbl_settings_debug = lv_label_create(tab_settings);
@@ -1066,7 +1149,7 @@ static void build_ui() {
 
   lbl_settings_power_off = lv_label_create(tab_settings);
   lv_obj_set_style_text_font(lbl_settings_power_off, &::lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(lbl_settings_power_off, lv_color_hex(0xF87171), 0);
+  lv_obj_set_style_text_color(lbl_settings_power_off, lv_color_hex(ncir_ui::red), 0);
   lv_obj_align(lbl_settings_power_off, LV_ALIGN_TOP_LEFT, 8, 112);
   lv_label_set_text(lbl_settings_power_off, "Power off");
 
@@ -1079,14 +1162,14 @@ static void build_ui() {
   lbl_settings_notice = lv_label_create(tab_settings);
   lv_obj_set_width(lbl_settings_notice, 300);
   lv_obj_set_style_text_font(lbl_settings_notice, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_settings_notice, lv_color_hex(0xFCD34D), 0);
+  lv_obj_set_style_text_color(lbl_settings_notice, lv_color_hex(ncir_ui::yellow), 0);
   lv_obj_align(lbl_settings_notice, LV_ALIGN_TOP_LEFT, 8, 154);
   lv_label_set_long_mode(lbl_settings_notice, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_settings_notice, "");
 
   lbl_settings_hint = lv_label_create(tab_settings);
-  lv_obj_set_style_text_font(lbl_settings_hint, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_settings_hint, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_font(lbl_settings_hint, &::lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lbl_settings_hint, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_settings_hint, LV_ALIGN_TOP_LEFT, 8, 178);
   lv_label_set_text(lbl_settings_hint, "Idle 2 min: sleep\nLeft/Right: tabs  Up/Down: select\nPress: change / power off");
 
@@ -1110,14 +1193,14 @@ static void build_ui() {
   lbl_alerts_notice = lv_label_create(tab_alerts);
   lv_obj_set_width(lbl_alerts_notice, 300);
   lv_obj_set_style_text_font(lbl_alerts_notice, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_alerts_notice, lv_color_hex(0xFCD34D), 0);
+  lv_obj_set_style_text_color(lbl_alerts_notice, lv_color_hex(ncir_ui::yellow), 0);
   lv_obj_align(lbl_alerts_notice, LV_ALIGN_TOP_LEFT, 8, 92);
   lv_label_set_long_mode(lbl_alerts_notice, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_alerts_notice, "");
 
   lbl_alerts_hint = lv_label_create(tab_alerts);
   lv_obj_set_style_text_font(lbl_alerts_hint, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_alerts_hint, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_color(lbl_alerts_hint, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_alerts_hint, LV_ALIGN_TOP_LEFT, 8, 142);
   lv_label_set_text(lbl_alerts_hint, "Left/Right: tabs\nUp/Down: select alert item\nPress: change/apply");
 
@@ -1136,21 +1219,34 @@ static void build_ui() {
   lbl_calibration_notice = lv_label_create(tab_calibration);
   lv_obj_set_width(lbl_calibration_notice, 300);
   lv_obj_set_style_text_font(lbl_calibration_notice, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_calibration_notice, lv_color_hex(0xFCD34D), 0);
+  lv_obj_set_style_text_color(lbl_calibration_notice, lv_color_hex(ncir_ui::yellow), 0);
   lv_obj_align(lbl_calibration_notice, LV_ALIGN_TOP_LEFT, 8, 68);
   lv_label_set_long_mode(lbl_calibration_notice, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_calibration_notice, "Use this to correct quartz readings.");
 
   lbl_calibration_hint = lv_label_create(tab_calibration);
   lv_obj_set_style_text_font(lbl_calibration_hint, &::lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_calibration_hint, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_color(lbl_calibration_hint, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_calibration_hint, LV_ALIGN_TOP_LEFT, 8, 126);
   lv_label_set_text(lbl_calibration_hint, "Up/Down: adjust offset\nPress: save offset");
 
+  // Persistent HUD. The battery label remains driven by the real power readings.
+  lv_obj_t* brand = lv_label_create(scr);
+  lv_label_set_text(brand, "NCIR//OS");
+  lv_obj_set_style_text_font(brand, &::lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(brand, lv_color_hex(ncir_ui::cyan), 0);
+  lv_obj_set_pos(brand, 6, 1);
+  lv_obj_t* hud_line = lv_obj_create(scr);
+  lv_obj_set_size(hud_line, 320, 1);
+  lv_obj_set_pos(hud_line, 0, 17);
+  lv_obj_set_style_bg_color(hud_line, lv_color_hex(ncir_ui::cyan), 0);
+  lv_obj_set_style_bg_opa(hud_line, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hud_line, 0, 0);
+  lv_obj_remove_flag(hud_line, LV_OBJ_FLAG_CLICKABLE);
   // Battery status in its own strip, above every tab.
   lbl_battery = lv_label_create(scr);
   lv_obj_set_style_text_font(lbl_battery, &::lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x64748B), 0);
+  lv_obj_set_style_text_color(lbl_battery, lv_color_hex(ncir_ui::muted), 0);
   lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -6, 1);
   lv_label_set_text(lbl_battery, "--%");
   lv_obj_move_foreground(lbl_battery);
@@ -1167,13 +1263,20 @@ static void update_ui() {
           ? "Lift holding target" : "Lift moving to target") : "Lift released - press to center");
   snprintf(buf, sizeof(buf), "Target: %d mm\nCommand: %d deg", lift.target_mm, lift.commanded_deg);
   set_label_text_if_changed(lbl_lift_position, buf);
-  const lv_color_t selected_color = lv_color_hex(0x22D3EE);
-  const lv_color_t normal_color = lv_color_hex(0x94A3B8);
-  const lv_color_t accent_color = lv_color_hex(0xFCD34D);
+  const lv_color_t selected_color = lv_color_hex(ncir_ui::cyan);
+  const lv_color_t normal_color = lv_color_hex(ncir_ui::muted);
+  const lv_color_t accent_color = lv_color_hex(ncir_ui::yellow);
 
   if (tabview != nullptr) {
     current_tab = clamp_value((int)lv_tabview_get_tab_active(tabview), 0, TAB_COUNT - 1);
   }
+
+  set_label_text_if_changed(lbl_live_hint, selected_live_row < 0
+      ? "Down: fans   Left/Right: tabs"
+      : "Up: select / exit   Press: toggle");
+  update_temperature_animation();
+  update_fan_animation(fan_lottie, fan_state_known, fan_on);
+  update_fan_animation(smoke_fan_lottie, smoke_fan_state_known, smoke_fan_on);
 
   // Battery (all tabs)
   if (battery_level_pct >= 0) {
@@ -1207,12 +1310,12 @@ static void update_ui() {
     lv_obj_set_style_bg_color(bar_live_temp, zone_color_from_temp_f(object_temp_f), LV_PART_INDICATOR);
 
     if (live_tab_page != nullptr) {
-      lv_color_t live_bg = alert_visual_active ? lv_color_hex(0x14532D) : lv_color_hex(0x0F172A);
+      lv_color_t live_bg = alert_visual_active ? lv_color_hex(0x14532D) : lv_color_hex(ncir_ui::background);
       lv_obj_set_style_bg_color(live_tab_page, live_bg, 0);
       lv_obj_set_style_bg_opa(live_tab_page, LV_OPA_COVER, 0);
     }
     if (live_hero_panel != nullptr) {
-      lv_color_t border = alert_visual_active ? lv_color_hex(0x4ADE80) : zone_color_from_temp_f(object_temp_f);
+      lv_color_t border = alert_visual_active ? lv_color_hex(ncir_ui::green) : zone_color_from_temp_f(object_temp_f);
       lv_obj_set_style_border_color(live_hero_panel, border, 0);
       lv_obj_set_style_border_width(live_hero_panel, alert_visual_active ? 2 : 1, 0);
     }
@@ -1228,7 +1331,7 @@ static void update_ui() {
     set_label_text_if_changed(lbl_live_fan, buf);
     lv_obj_set_style_text_color(
         lbl_live_fan,
-        fan_state_known ? (fan_on ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8)) : lv_color_hex(0x94A3B8),
+        fan_state_known ? (fan_on ? lv_color_hex(ncir_ui::green) : lv_color_hex(ncir_ui::muted)) : lv_color_hex(ncir_ui::muted),
         0);
 
     if (smoke_fan_state_known) {
@@ -1239,23 +1342,23 @@ static void update_ui() {
     set_label_text_if_changed(lbl_live_smoke_fan, buf);
     lv_obj_set_style_text_color(
         lbl_live_smoke_fan,
-        smoke_fan_state_known ? (smoke_fan_on ? lv_color_hex(0x4ADE80) : normal_color) : normal_color,
+        smoke_fan_state_known ? (smoke_fan_on ? lv_color_hex(ncir_ui::green) : normal_color) : normal_color,
         0);
 
     lv_obj_set_style_border_color(
         btn_live_fan,
-        selected_live_row == LIVE_ROW_FAN ? selected_color : lv_color_hex(0x334155),
+        selected_live_row == LIVE_ROW_FAN ? selected_color : lv_color_hex(ncir_ui::line),
         0);
     lv_obj_set_style_border_color(
         btn_live_smoke_fan,
-        selected_live_row == LIVE_ROW_SMOKE_FAN ? selected_color : lv_color_hex(0x334155),
+        selected_live_row == LIVE_ROW_SMOKE_FAN ? selected_color : lv_color_hex(ncir_ui::line),
         0);
 
     snprintf(buf, sizeof(buf), "WiFi %s", wifi_connected ? "OK" : "--");
     set_label_text_if_changed(lbl_live_wifi, buf);
     lv_obj_set_style_text_color(
         lbl_live_wifi,
-        wifi_connected ? lv_color_hex(0x4ADE80) : lv_color_hex(0x94A3B8),
+        wifi_connected ? lv_color_hex(ncir_ui::green) : lv_color_hex(ncir_ui::muted),
         0);
 
     set_label_text_if_changed(lbl_live_fan_notice, fan_notice_text);
@@ -1321,7 +1424,7 @@ static void update_ui() {
         0);
     lv_obj_set_style_text_color(
         lbl_settings_power_off,
-        selected_settings_row == SETTINGS_ROW_POWER_OFF ? lv_color_hex(0xF87171) : lv_color_hex(0x94A3B8),
+        selected_settings_row == SETTINGS_ROW_POWER_OFF ? lv_color_hex(ncir_ui::red) : lv_color_hex(ncir_ui::muted),
         0);
     lv_obj_set_style_bg_color(
         slider_settings_emissivity,
@@ -1329,7 +1432,7 @@ static void update_ui() {
         LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(
         slider_settings_emissivity,
-        emissivity_edit_mode ? accent_color : lv_color_hex(0x334155),
+        emissivity_edit_mode ? accent_color : lv_color_hex(ncir_ui::line),
         LV_PART_KNOB);
     set_label_text_if_changed(
         lbl_settings_hint,
@@ -1368,7 +1471,7 @@ static void update_ui() {
         LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(
         slider_alerts_threshold,
-        alert_threshold_edit_mode ? accent_color : lv_color_hex(0x334155),
+        alert_threshold_edit_mode ? accent_color : lv_color_hex(ncir_ui::line),
         LV_PART_KNOB);
     set_label_text_if_changed(
         lbl_alerts_hint,
@@ -1399,7 +1502,7 @@ static void update_ui() {
         LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(
         slider_calibration_offset,
-        calibration_edit_mode ? accent_color : lv_color_hex(0x334155),
+        calibration_edit_mode ? accent_color : lv_color_hex(ncir_ui::line),
         LV_PART_KNOB);
     set_label_text_if_changed(
         lbl_calibration_hint,
@@ -1591,7 +1694,7 @@ static void handle_joystick_navigation() {
   if (!read_joystick2_raw(rawX, rawY, pressed)) return;
 
   // Connector on the right, stick on the left: swap the navigation axes.
-  int x = JOY_CENTER - (int)rawY;
+  int x = (int)rawY - JOY_CENTER;
   int y = (int)rawX - JOY_CENTER;
   if (joystick_has_activity(x, y, pressed)) {
     note_user_activity();
@@ -1603,7 +1706,9 @@ static void handle_joystick_navigation() {
   uint32_t now = millis();
 
   // Left / right tabs
-  if (!any_edit_mode_active()) {
+  if (!any_edit_mode_active() &&
+      (current_tab != LIVE_TAB_INDEX ||
+       (selected_live_row < 0 && abs(filtered_y) <= JOY_NAV_V_THRESH))) {
     if (filtered_x > JOY_NAV_H_THRESH && (now - last_lr_nav_ms > JOY_NAV_REPEAT_MS)) {
       goto_tab(current_tab + 1);
       last_lr_nav_ms = now;
@@ -1616,7 +1721,7 @@ static void handle_joystick_navigation() {
   // Live webhook selection and settings adjustments with up/down
   if (current_tab == LIVE_TAB_INDEX) {
     if (filtered_y > JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
-      selected_live_row = clamp_value(selected_live_row - 1, 0, LIVE_ROW_COUNT - 1);
+      selected_live_row = clamp_value(selected_live_row - 1, -1, LIVE_ROW_COUNT - 1);
       last_ud_nav_ms = now;
     } else if (filtered_y < -JOY_NAV_V_THRESH && (now - last_ud_nav_ms > JOY_NAV_REPEAT_MS)) {
       selected_live_row = clamp_value(selected_live_row + 1, 0, LIVE_ROW_COUNT - 1);
@@ -1699,7 +1804,7 @@ static void handle_joystick_navigation() {
   }
   if (pressed && !last_button_pressed && (now - last_button_ms > JOY_BUTTON_DEBOUNCE_MS)) {
     if (current_tab == LIVE_TAB_INDEX) {
-      toggle_selected_webhook();
+      if (selected_live_row >= 0) toggle_selected_webhook();
     } else if (current_tab == SETTINGS_TAB_INDEX) {
       activate_selected_setting();
     } else if (current_tab == ALERTS_TAB_INDEX) {
@@ -1805,6 +1910,14 @@ void setup() {
 }
 
 void loop() {
+  // One runtime checkpoint after startup, without logging credentials or URLs.
+  static bool runtime_checkpoint_logged = false;
+  if (!runtime_checkpoint_logged && millis() >= 30000) {
+    Serial.printf("Runtime: 30s alive; loop stack free minimum=%u bytes; heap free=%u bytes\n",
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+                  (unsigned)ESP.getFreeHeap());
+    runtime_checkpoint_logged = true;
+  }
   M5.update();
   update_alert_jingle();
   if (touch_has_activity()) {

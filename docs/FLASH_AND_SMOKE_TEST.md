@@ -68,7 +68,7 @@ Compile `test/lift_control_test.cpp` with a host C++17 compiler and `-Iinclude`,
 
 For hardware checks, follow [NCIR_LIFT.md](NCIR_LIFT.md). Start unloaded with a verified ME-X8 V1 positional servo and appropriate U165 supply. Enable centers immediately. Support the carriage before release or disconnection. Narrow travel before the first assembled trial. Confirm direction, actual low/middle/high height, clearances, supply stability and UI responsiveness. Verify idle sleep remains inhibited while holding or release is unconfirmed, then resumes after release. Controller acknowledgement is not position feedback.
 
-## Current checkout evidence - 2026-10-06
+## Historical checkout evidence - 2026-10-06
 
 - PlatformIO `m5stack-cores3` release build: SUCCESS.
 - RAM: 141,748 / 327,680 bytes (43.3%).
@@ -89,3 +89,12 @@ Record:
 - Board/port used
 - Pass/fail for each section above
 - Any measured charge current, battery temperature, network latency, or fan mismatch
+
+## UI revision evidence - 2026-10-07
+
+- Cyberdeck-inspired NCIR//OS UI, temperature Lottie icons, and two distinct Lottie fan icons added.
+- A device-observed `loopTask` stack overflow was corrected with a 32 KiB stack. The fan-animation build reached its 30-second checkpoint with 11,708 bytes minimum stack headroom and 87,468 bytes free heap; a 40-second serial observation showed no crash markers.
+- The user confirmed COLD icon playback. GOOD/HOT transitions and fan ON/OFF visuals remain device checks.
+- The latest direction/focus revision built and flashed to COM3: all four flash regions verified, hard reset completed, and COM3 released. Physical right/left direction and fan-focus locking remain to be confirmed by the user.
+- On Live, Down selects Fan then Smoke Fan. Left/Right must not switch tabs while a fan is highlighted. Up past Fan clears the highlight and unlocks tabs. Press without a highlight must send no webhook.
+- Fan ON plays; OFF freezes/dims; unknown remains dim with `--`. Verify these states after normal webhook use and confirm UI responsiveness with both fans ON. State is locally inferred, not authoritative smart-plug feedback.

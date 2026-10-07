@@ -4,6 +4,8 @@ Firmware for an **M5Stack CoreS3** that reads object temperature with an **MLX90
 
 Built with **PlatformIO**, **Arduino**, **M5Unified**, and **LVGL 9**.
 
+The **NCIR//OS** interface adapts the cyan/magenta Cyberdeck HUD style to the CoreS3's 320 × 240 screen. See [visual adaptation and device checks](docs/CYBERDECK_UI.md).
+
 ---
 
 ## Table of contents
@@ -164,7 +166,7 @@ Six tabs at the top of the screen. **Battery** (`92%+`) is shown in the top-righ
 | **e 0.95** | Current emissivity |
 | Cyan outline | Currently selected webhook control |
 | Yellow notice | Webhook status; the sending message remains visible until the request finishes |
-| Hint | `Up/Down: select   Press: toggle` |
+| Hint | `Down: fans   Left/Right: tabs` |
 
 Card border turns **green** when an alert is active.
 
@@ -216,12 +218,12 @@ Joystick is read over I2C (center ≈ **128**). Values are low-pass filtered.
 
 | Input | Action (global) |
 |-------|------------------|
-| **Left / Right** | Previous / next tab |
+| **Left / Right** | Previous / next tab; blocked while a Live fan is highlighted |
 | **Press** | Context action (see tab) |
 
 | Tab | Up / Down | Press |
 |-----|-----------|-------|
-| **Live** | Select Fan / Smoke Fan | Toggle selected webhook |
+| **Live** | Down: Fan, then Smoke Fan; Up past Fan: clear highlight | Toggle highlighted webhook; no action without highlight |
 | **Settings** | Move selection / adjust emissivity in edit mode | Change or apply |
 | **Alerts** | Move selection / adjust threshold in edit mode | Change or apply |
 | **Cal** | Move selection / adjust offset in edit mode | Save offset |
@@ -415,3 +417,5 @@ See [docs/PERFORMANCE_AND_ROADMAP.md](docs/PERFORMANCE_AND_ROADMAP.md) for prior
 Source: [ReptilePvP/ncir-reset](https://github.com/ReptilePvP/ncir-reset) on GitHub.
 
 Do not commit `include/secrets.h` — it is listed in `.gitignore`.
+
+On Live, Down highlights Fan, then Smoke Fan. While either fan is highlighted, left/right cannot switch tabs. Move Up past Fan to clear the highlight and resume tab navigation. Press toggles only a highlighted fan. Horizontal joystick direction follows the physical direction.

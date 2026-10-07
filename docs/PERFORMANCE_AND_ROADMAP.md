@@ -2,11 +2,13 @@
 
 This roadmap prioritizes changes by expected user-visible value. Measure before and after each optimization; the release has substantial flash headroom, so responsiveness, I2C efficiency, and reliability matter more than binary size.
 
-## Current implementation (2026-10-06)
+## Current implementation (2026-10-07)
 
 Six tabs include the optional ME-X8 lift. Normal lift targets use direct pulse commands every 20 ms at most; joystick repeat is at least 35 ms with 1/5 mm steps. Optional bench mode alone retains slow stepping. Host controller tests already cover mapping, limits, holding, faults, lockout and rollover. Loaded travel, power stability and actual speed remain to be measured.
 
 Joystick navigation is mapped for connector-right/stick-left orientation. Angle-to-pulse conversion clamps every command to 30-180 degrees (833-2500 us), while normal lift targets use 30-150 degrees. Alerts use a four-note ascending jingle once per threshold crossing and rearm immediately below the threshold.
+
+The NCIR//OS styling now uses dark surfaces with cyan/magenta accents. Three embedded Lottie temperature animations and two distinct fan animations render on Live. Fan animations follow locally inferred webhook state, pause outside Live, and freeze/dim for OFF or unknown state. A 32 KiB Arduino task stack fixes the observed ThorVG stack overflow. Live fan selection blocks horizontal tab navigation; Up past Fan clears the highlight. Physical right now maps to next tab following the reported direction correction.
 
 ## Performance priorities
 
