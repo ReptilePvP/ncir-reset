@@ -4,6 +4,8 @@ Firmware for an **M5Stack CoreS3** that reads object temperature with an **MLX90
 
 Built with **PlatformIO**, **Arduino**, **M5Unified**, and **LVGL 9**.
 
+This repository is the older **NCIR Reset** fan/lift firmware. The separate newer quartz-thermometer project is deferred at `Desktop/M5Stack - Newer Quartz Thermometer - Deferred`; its PaHub wiring and feature set do not apply here.
+
 The **NCIR//OS** interface adapts the cyan/magenta Cyberdeck HUD style to the CoreS3's 320 × 240 screen. See [visual adaptation and device checks](docs/CYBERDECK_UI.md).
 
 ---
@@ -70,7 +72,7 @@ Angle conversion is clamped to 30-180 degrees (833-2500 us); normal 0-50 mm heig
 
 Boot requests external Port A power after display initialization (`M5.Power.setExtOutput(true)`). This request is not evidence of connector voltage; earlier serial captures reported BUS_EN OFF. Use the U165 documented motor supply and verify power under load.
 
-Battery charging is explicitly enabled at **4.20 V / 500 mA**. The UI appends `+` to the battery percentage only while M5Unified reports an active charging state.
+The application prints charge constants of **4.20 V / 500 mA**, but does not call `setBatteryCharge`, `setChargeCurrent`, or `setChargeVoltage`. That boot message does not confirm charger configuration or current. The UI derives percentage from `getBatteryLevel()` and its `+` suffix from `isCharging()`; neither proves that the battery can power the device. The charging enum is currently converted to bool, so an unknown charging state can also produce `+`.
 
 ```
 CoreS3 (Port A)
@@ -259,6 +261,14 @@ Zones use **object temperature in °F** internally (even when displaying °C).
 
 Constants: `IDLE_SLEEP_TIMEOUT_MS`, `TEMP_ACTIVITY_DELTA_F`, `USB_POWER_PRESENT_MV`, and `SLEEP_POLL_US` in `main.cpp`.
 
+### Battery / USB issue reported 2026-10-29
+
+The user reports immediate power loss when USB is unplugged and a battery percentage that counts down after startup. This is unresolved. Immediate loss of power is separate from the 120-second idle timer; the source has no USB-removal shutdown branch. A 10-second passive COM3 capture on 2026-10-29 yielded no battery/sleep telemetry, so current battery voltage, presence and charging state were not established.
+
+Record percentage, BAT millivolts, VBUS millivolts, AXP2101 battery-present state and charging state together. The startup line includes percentage/BAT/VBUS/presence, but not live charging state. Check the DIN Base switch and seating, then test battery-only boot with external peripherals disconnected. A falling percentage alone cannot distinguish a discharged battery, contact/protection fault, or invalid battery reading. Do not force charging or bypass battery protection. See the [power diagnostic checklist](docs/FLASH_AND_SMOKE_TEST.md#battery-path-diagnosis).
+
+Sleep is a display-off/polled light-sleep mode: sensor sampling and normal LVGL processing stop while asleep. It is not continuous temperature monitoring. No sleep or charging fix was applied during this documentation release.
+
 ### Power off
 
 Settings → **Power off** → press joystick.
@@ -374,7 +384,9 @@ Enable **Debug: ON** in Settings. At 115200 baud you will see:
 | WiFi `--` | `secrets.h`, signal, 10 s connect timeout; reconnect every 5 s cooldown |
 | A webhook fails | Corresponding URL in `secrets.h`, HTTP 2xx expected, serial debug for code |
 | A displayed device state disagrees with reality | Current firmware remembers successful toggles; it does not query physical state |
-| Sleep right after use | Ensure latest firmware (idle timer underflow fix) |
+| Never sleeps on USB | Expected: VBUS at or above 4.0 V blocks idle sleep |
+| Never sleeps on battery | Check temperature changes of 1 F or more, joystick drift/input, touch, edit mode, restart, and enabled/unreleased lift |
+| Immediately powers off after USB removal / percentage counts down | Unresolved battery-path report; check DIN Base switch/seating and isolated battery-only boot; collect BAT/VBUS/presence/charge telemetry |
 | Emissivity change needs reboot | By design; wait for automatic restart |
 | UI clipped / overlapping | Live tab uses fixed layout; rebuild after UI changes |
 | Power off won’t return | Normal — use hardware **power button** on CoreS3 |
@@ -385,15 +397,17 @@ For a complete post-flash procedure, see [docs/FLASH_AND_SMOKE_TEST.md](docs/FLA
 
 ## Release status
 
-Documentation reviewed against the current source on **2026-10-06**. See [the flash checklist](docs/FLASH_AND_SMOKE_TEST.md) for current build evidence and post-flash checks. Earlier COM3 uploads and boot captures are recorded in [the lift guide](docs/NCIR_LIFT.md); they do not prove that this checkout is currently installed or that loaded movement is verified.
+Documentation reviewed against the current source on **2026-10-30**. See [the flash checklist](docs/FLASH_AND_SMOKE_TEST.md) for current build evidence and post-flash checks. Earlier COM3 uploads and boot captures are recorded in [the lift guide](docs/NCIR_LIFT.md); they do not prove that this checkout is currently installed or that loaded movement is verified.
 
 Verified by build or source inspection:
 
-- M5Unified charging APIs compile for the CoreS3 AXP2101 at 4.20 V / 500 mA.
+- Charge constants are printed, but this application does not explicitly apply them through charging APIs.
 - USB VBUS gates idle sleep and is checked during battery sleep polling.
 - Fan and Smoke Fan HTTP work runs outside the main UI loop with atomic duplicate-request protection.
-- Unused LVGL logging, Lottie, QR, vector/ThorVG, examples, and demos are disabled.
+- Lottie, vector graphics and internal ThorVG are enabled for five embedded animations. LVGL logging, QR, examples and demos are disabled.
 - `include/secrets.h` remains ignored and was not committed.
+
+The reported USB-removal shutdown and falling battery percentage remain unresolved. This documentation release does not flash the device.
 
 Still requiring physical observation after a flash:
 

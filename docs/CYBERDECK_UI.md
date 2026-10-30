@@ -10,6 +10,10 @@ The Live temperature panel also includes [embedded Lottie temperature animations
 
 The adaptation does not add Cyberdeck's SSH, music, portal, OTA, keyboard integration, boot animation, or CRT effects. Those are separate features; full-screen effects could obscure readings and increase redraw costs.
 
+## Current status (2026-10-30)
+
+The header still displays raw power-controller percentage and charging indication; it does not validate battery presence or usable capacity. The reported USB-removal shutdown and falling percentage are unresolved. See [battery-path checks](FLASH_AND_SMOKE_TEST.md#battery-path-diagnosis). The 2026-10-07 upload/playback observations are historical; this documentation refresh does not establish the currently installed binary.
+
 ## Device review
 
 After uploading, check all six tabs with the joystick, confirm the active tab has a cyan label and magenta border, and confirm the header and temperature remain readable. Scroll Settings to its footer. Exercise both fan selections and request notices, units, sliders, and alert highlighting. Check lift messages with the existing hardware precautions in [NCIR_LIFT.md](NCIR_LIFT.md).

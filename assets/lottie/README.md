@@ -2,6 +2,8 @@
 
 The three temperature animations are original NCIR assets in standard Lottie JSON format. The two fan animations are distinct LottieFiles community assets, embedded as part of this firmware under the [Lottie Simple License](https://lottiefiles.com/page/license).
 
+Reviewed against the source on 2026-10-30. All five animations remain embedded; `LV_USE_LOTTIE`, vector graphics and internal ThorVG are enabled. This release updates documentation only. Earlier COLD playback confirmation does not verify every animation or current device behavior.
+
 ## Fan animation credits and behavior
 
 - `fan.json`: [Rotating Fan by Mudit Khandelwal](https://lottiefiles.com/free-animation/rotating-fan-rl8QVBYjhQ). Three-second rotating-blade loop.

@@ -35,12 +35,21 @@ The flash passes only when esptool reports `Hash of data verified` for every seg
 - NCIR reading updates and reacts when a warmer or cooler target is presented.
 - Hold Joystick2 connector-right/stick-left; verify Left/Right changes tabs, Up/Down selects or adjusts the current control, and its button performs the tab-specific action.
 - Touch input is detected.
-- Battery percentage is visible; `+` appears only while actively charging.
+- Battery percentage is visible. Cross-check `+` against the actual charging enum: the application stores `isCharging()` in a bool, so M5Unified `charge_unknown` also converts to true. The suffix alone is not proof of charging.
+
+### Battery-path diagnosis
+
+Reported 2026-10-29: immediate shutdown when USB is unplugged, and battery percentage counts down after startup. A 10-second passive COM3 capture received no battery/sleep telemetry. No current battery voltage, presence or charge-state diagnosis was obtained.
+
+1. With USB attached, record percentage, BAT voltage, VBUS voltage, AXP2101 `getBatState()` and charging state together. Startup currently prints the first four, not charging state. The charge-settings message prints constants; the application does not apply charger-setting APIs.
+2. Check DIN Base switch position and CoreS3 seating. With the carriage supported and motor supply disconnected, remove external peripherals and attempt battery-only boot. Record whether it starts and stays on.
+3. If it still loses power immediately, inspect the base/contact/battery path before evaluating idle sleep. Do not force-charge an undetected battery or bypass protection.
+4. A falling percentage alone is insufficient evidence of discharge or successful charging. Mark battery-only operation unresolved until it is physically demonstrated.
 
 ### USB power and sleep
 
 1. Leave USB connected and provide no input for more than two minutes. The display must remain awake.
-2. Disconnect USB and hold the measured scene steady. After two minutes without qualifying activity, the display should sleep.
+2. First confirm the device stays powered on battery. Release the supported lift and exit all edit modes. Disconnect USB and hold the measured scene steady. After two minutes without qualifying activity, the display should sleep.
 3. Wake with touch and then with joystick input in separate trials.
 4. Let the device sleep on battery, then connect USB. It should wake during the 200 ms sleep-poll cycle.
 5. Confirm that an object-temperature change of at least 1 F from the activity baseline resets the idle timer.
@@ -98,3 +107,14 @@ Record:
 - The latest direction/focus revision built and flashed to COM3: all four flash regions verified, hard reset completed, and COM3 released. Physical right/left direction and fan-focus locking remain to be confirmed by the user.
 - On Live, Down selects Fan then Smoke Fan. Left/Right must not switch tabs while a fan is highlighted. Up past Fan clears the highlight and unlocks tabs. Press without a highlight must send no webhook.
 - Fan ON plays; OFF freezes/dims; unknown remains dim with `--`. Verify these states after normal webhook use and confirm UI responsiveness with both fans ON. State is locally inferred, not authoritative smart-plug feedback.
+
+## Documentation release validation - 2026-10-30
+
+- Reviewed all six project Markdown documents against the current application, LVGL configuration and lift controller. Firmware source is unchanged.
+- PlatformIO `m5stack-cores3` release build: SUCCESS.
+- RAM: 161,708 / 327,680 bytes (49.3%).
+- Flash: 1,874,825 / 6,553,600 bytes (28.6%).
+- Firmware SHA-256: `8db76601f13aa1167d8f31ca041216c00ed02d0d2e58caaed4d7d109628914dd`.
+- Host regression freshly rebuilt with `.pio/host-tools/ziglang/zig.exe c++ -std=c++17 -Iinclude test/lift_control_test.cpp -o .pio/lift_control_test.exe`, then executed: `PASS: mapping, limits, slew, faults, lockout, bench deadline and rollover`.
+- No upload, device reset, motor command or hardware smoke test performed. USB-removal shutdown, battery state, loaded travel and physical webhook behavior remain unverified.
+- The documentation commit is identified by Git history; the hash above identifies the locally built firmware, not the installed device image.

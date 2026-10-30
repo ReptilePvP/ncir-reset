@@ -1,6 +1,6 @@
 # NCIR vertical lift - MEUS ME-X8 servo
 
-## Current mode: full manual lift (reviewed 2026-10-06)
+## Current mode: full manual lift (reviewed 2026-10-30)
 
 Full manual control is enabled (`motion_allowed = true`, `bench_test = false`).
 Use the MEUS ME-X8 V1 positional servo identified by the supplied Amazon ASIN B0CB8N6KLC. Press in Lift to enable at center (25 mm),
@@ -27,6 +27,12 @@ detected on COM3, all four flash hashes verified, hard reset, PlatformIO SUCCESS
 Subsequent USB-reset logs reached interface rendered, Wi-Fi connected, NCIR init
 OK and Boot ready. COM3 released. Boot still reports BUS_EN OFF and no detected
 battery; no motor-load or black-screen resolution is claimed.
+
+## Current project and power boundaries
+
+This firmware still targets the ME-X8 V1 through U165; newer rack/lead-screw/ROLLER485 CAD concepts do not change this controller or its crank mapping. Validate mechanical compatibility before using a different mechanism. NCIR remains on Pa.Hub channel 5 here; channel 0 is the U165. The separate newer quartz-thermometer firmware uses different wiring and is deferred in the labeled Desktop folder.
+
+On 2026-10-29 the user reported immediate shutdown when USB is unplugged and a falling battery percentage. Battery-only operation remains unresolved; see [battery-path diagnosis](FLASH_AND_SMOKE_TEST.md#battery-path-diagnosis). This is separate from sleep inhibition while holding a lift. No loaded-motion or battery fix is established by a build.
 
 ## Servo-specific profile (2026-09-30)
 
@@ -150,7 +156,7 @@ This is not the 8Servos HAT protocol. See the
 
 Navigate right past Cal to the **Lift** tab using Joystick2.
 Hold Joystick2 with its connector on the right and stick on the left. Navigation
-uses `x = 128 - rawY` and `y = rawX - 128` before low-pass filtering; positive
+uses `x = rawY - 128` and `y = rawX - 128` before low-pass filtering; positive
 filtered Y raises the height target.
 
 - **Press:** enable at the middle position (25 mm / default 90 degrees).

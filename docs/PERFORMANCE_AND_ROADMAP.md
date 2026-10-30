@@ -2,7 +2,7 @@
 
 This roadmap prioritizes changes by expected user-visible value. Measure before and after each optimization; the release has substantial flash headroom, so responsiveness, I2C efficiency, and reliability matter more than binary size.
 
-## Current implementation (2026-10-07)
+## Current implementation (reviewed 2026-10-30)
 
 Six tabs include the optional ME-X8 lift. Normal lift targets use direct pulse commands every 20 ms at most; joystick repeat is at least 35 ms with 1/5 mm steps. Optional bench mode alone retains slow stepping. Host controller tests already cover mapping, limits, holding, faults, lockout and rollover. Loaded travel, power stability and actual speed remain to be measured.
 
@@ -69,7 +69,7 @@ Display these on a hidden diagnostics page or print them once every 10 seconds w
 
 ### P3 - Trim LVGL configuration further only if needed
 
-Logging, demos, examples, Lottie, QR, and vector/ThorVG are already disabled. Additional unused widgets, decoders, filesystems, themes, and fonts can be disabled later, but flash is not currently constrained.
+Logging, demos, examples and QR are disabled. Lottie, vector graphics and internal ThorVG are enabled and required by the five embedded Live-page animations. Additional unused widgets, decoders, filesystems, themes, and fonts can be disabled later, but flash is not currently constrained.
 
 ## Reliability and safety priorities
 
@@ -80,7 +80,7 @@ Prioritize a guarded lift bench trial: confirm supply stability, horn/cradle fit
 2. **Fail-safe temperature control:** optionally turn the fan on automatically above a configurable threshold and keep manual override explicit. Define behavior for WiFi loss.
 3. **Webhook security:** prefer HTTPS, avoid long-lived tokens in URLs when possible, and document certificate/time requirements.
 4. **Watchdog and fault recovery:** count consecutive sensor/hub failures, reinitialize the affected bus/channel, and show a clear fault instead of silently retaining stale data.
-5. **Battery protection validation:** measure charge current and battery temperature on the actual CoreS3/DIN base before treating 500 mA as hardware-validated.
+5. **Battery-path diagnosis first:** the 2026-10-29 report describes immediate power loss on USB removal and a falling percentage. Collect BAT/VBUS/presence/charging telemetry and test isolated battery-only boot before optimizing sleep. The application prints 500 mA / 4.20 V constants without applying charge-setting APIs; do not interpret the boot message as confirmed charger configuration. See [the diagnostic checklist](FLASH_AND_SMOKE_TEST.md#battery-path-diagnosis).
 6. **USB serial diagnostics:** enable the appropriate ESP32-S3 USB CDC build flags if reliable boot logs over the programming cable are desired.
 7. **Automated checks:** add host-testable functions for threshold crossings, unit conversion, preference validation, and sleep decisions; add a compile workflow for pull requests. Current alerts have no hysteresis; test hysteresis only if it is introduced.
 
